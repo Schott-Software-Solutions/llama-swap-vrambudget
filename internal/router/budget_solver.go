@@ -118,8 +118,9 @@ func (s *budgetSolver) Solve(target string, running []string, activity map[strin
 		plan = solveBudgetExhaustive(candidates, requiredMiB)
 	} else {
 		// Above 20 candidates, avoid exponential work. The deterministic
-		// fallback retains the primary rules (idle before busy, then LRU) and
-		// greedily adds victims until enough memory has been freed.
+		// fallback retains the two primary rules (idle-only when possible and
+		// minimum victim count) by taking the largest candidates first. LRU,
+		// cost, and model ID break equal-size ties.
 		plan = solveBudgetGreedy(candidates, requiredMiB)
 	}
 	if plan == nil {
@@ -190,10 +191,23 @@ func solveBudgetExhaustive(candidates []budgetCandidate, requiredMiB int) *evict
 }
 
 func solveBudgetGreedy(candidates []budgetCandidate, requiredMiB int) *evictionPlan {
-	ordered := slices.Clone(candidates)
+	idleMemoryMiB := 0
+	for _, candidate := range candidates {
+		if !candidate.busy {
+			idleMemoryMiB += candidate.memoryMiB
+		}
+	}
+
+	allowBusy := idleMemoryMiB < requiredMiB
+	ordered := make([]budgetCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if !candidate.busy || allowBusy {
+			ordered = append(ordered, candidate)
+		}
+	}
 	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].busy != ordered[j].busy {
-			return !ordered[i].busy
+		if ordered[i].memoryMiB != ordered[j].memoryMiB {
+			return ordered[i].memoryMiB > ordered[j].memoryMiB
 		}
 		if !ordered[i].at.Equal(ordered[j].at) {
 			return ordered[i].at.Before(ordered[j].at)
@@ -204,18 +218,8 @@ func solveBudgetGreedy(candidates []budgetCandidate, requiredMiB int) *evictionP
 		return ordered[i].id < ordered[j].id
 	})
 
-	idleMemoryMiB := 0
-	for _, candidate := range ordered {
-		if !candidate.busy {
-			idleMemoryMiB += candidate.memoryMiB
-		}
-	}
-	allowBusy := idleMemoryMiB < requiredMiB
 	plan := &evictionPlan{}
 	for _, candidate := range ordered {
-		if candidate.busy && !allowBusy {
-			continue
-		}
 		plan.victims = append(plan.victims, candidate.id)
 		plan.freedMiB += candidate.memoryMiB
 		plan.totalEvictCost += candidate.evictCost
@@ -237,8 +241,20 @@ func solveBudgetGreedy(candidates []budgetCandidate, requiredMiB int) *evictionP
 }
 
 func betterBudgetPlan(candidate, current *evictionPlan) bool {
+	// Plans are ranked lexicographically:
+	//   1. Never choose a busy victim when an idle-only plan can make progress.
+	//   2. Evict the fewest models, preventing an old but unnecessary model
+	//      from making a larger plan win.
+	//   3. Compare the sorted activity times oldest-first. With equal victim
+	//      counts this preserves LRU as the dominant choice among minimal plans.
+	//   4. Prefer lower configured eviction cost.
+	//   5. Prefer less excess memory freed.
+	//   6. Compare sorted model IDs for a deterministic final tie-break.
 	if candidate.includesBusy != current.includesBusy {
 		return !candidate.includesBusy
+	}
+	if len(candidate.victims) != len(current.victims) {
+		return len(candidate.victims) < len(current.victims)
 	}
 	for i := 0; i < min(len(candidate.idleOrder), len(current.idleOrder)); i++ {
 		if candidate.idleOrder[i].Equal(current.idleOrder[i]) {
@@ -248,9 +264,6 @@ func betterBudgetPlan(candidate, current *evictionPlan) bool {
 	}
 	if candidate.totalEvictCost != current.totalEvictCost {
 		return candidate.totalEvictCost < current.totalEvictCost
-	}
-	if len(candidate.victims) != len(current.victims) {
-		return len(candidate.victims) < len(current.victims)
 	}
 	if candidate.excessMiB != current.excessMiB {
 		return candidate.excessMiB < current.excessMiB

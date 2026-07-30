@@ -63,6 +63,24 @@ func TestBudgetSolver_EvictionPlans(t *testing.T) {
 			wantEvict: []string{"a"},
 		},
 		{
+			name:      "one sufficient victim wins over multiple",
+			budget:    80,
+			memory:    map[string]int{"a": 50, "b": 10, "target": 60},
+			running:   []string{"a", "b"},
+			target:    "target",
+			activity:  activities(base, "a", -2*time.Hour, "b", -10*time.Hour),
+			wantEvict: []string{"a"},
+		},
+		{
+			name:      "unnecessarily old extra victim cannot enlarge plan",
+			budget:    120,
+			memory:    map[string]int{"a": 50, "b": 10, "c": 50, "target": 60},
+			running:   []string{"a", "b", "c"},
+			target:    "target",
+			activity:  activities(base, "a", -2*time.Hour, "b", -10*time.Hour, "c", -time.Hour),
+			wantEvict: []string{"a"},
+		},
+		{
 			name:    "idle-only wins over busy",
 			budget:  130,
 			memory:  map[string]int{"idle": 50, "busy": 80, "target": 40},
@@ -176,6 +194,30 @@ func TestBudgetSolver_UnknownMemoryFailsConservatively(t *testing.T) {
 	}
 	if !slices.Equal(result.Evict, []string{"known", "unknown"}) {
 		t.Errorf("Evict=%v want all running models", result.Evict)
+	}
+}
+
+func TestBudgetSolver_GreedyFallbackMinimizesVictims(t *testing.T) {
+	memory := map[string]int{"large": 50, "target": 60}
+	running := []string{"large"}
+	activity := map[string]modelActivity{
+		"large": {readyAt: time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)},
+	}
+	for i := range exhaustiveBudgetCandidateLimit {
+		modelID := string(rune('a' + i))
+		memory[modelID] = 2
+		running = append(running, modelID)
+		activity[modelID] = modelActivity{
+			readyAt: time.Date(2026, 7, 29, i, 0, 0, 0, time.UTC),
+		}
+	}
+
+	result := newBudgetSolver(110, memory, nil).Solve("target", running, activity)
+	if result.Error != nil {
+		t.Fatalf("Solve error: %v", result.Error)
+	}
+	if !slices.Equal(result.Evict, []string{"large"}) {
+		t.Errorf("Evict=%v want [large]", result.Evict)
 	}
 }
 
