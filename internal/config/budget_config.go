@@ -6,9 +6,13 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 )
 
 const defaultBudgetMemoryMetadataKey = "projected_total_mib"
+const defaultKVCacheDirectory = "/tmp/kvcache"
+const defaultKVCacheTimeout = 30 * time.Second
 
 // BudgetConfig configures the memory-budget router.
 type BudgetConfig struct {
@@ -16,6 +20,7 @@ type BudgetConfig struct {
 	ReserveMiB        int                  `yaml:"reserve_mib"`
 	MemoryMetadataKey string               `yaml:"memory_metadata_key"`
 	Eviction          BudgetEvictionConfig `yaml:"eviction"`
+	KVCache           BudgetKVCacheConfig  `yaml:"kv_cache"`
 
 	memoryMiB map[string]int
 }
@@ -24,6 +29,31 @@ type BudgetConfig struct {
 type BudgetEvictionConfig struct {
 	Policy     string         `yaml:"policy"`
 	EvictCosts map[string]int `yaml:"evict_costs"`
+}
+
+// BudgetKVCacheConfig controls best-effort llama-server slot persistence.
+// Phase one deliberately supports only a single slot per model.
+type BudgetKVCacheConfig struct {
+	Enabled        bool          `yaml:"enabled"`
+	Directory      string        `yaml:"directory"`
+	SaveTimeout    time.Duration `yaml:"save_timeout"`
+	RestoreTimeout time.Duration `yaml:"restore_timeout"`
+	SingleSlotOnly bool          `yaml:"single_slot_only"`
+}
+
+func (c *BudgetKVCacheConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawBudgetKVCacheConfig BudgetKVCacheConfig
+	defaults := rawBudgetKVCacheConfig{
+		Directory:      defaultKVCacheDirectory,
+		SaveTimeout:    defaultKVCacheTimeout,
+		RestoreTimeout: defaultKVCacheTimeout,
+		SingleSlotOnly: true,
+	}
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+	*c = BudgetKVCacheConfig(defaults)
+	return nil
 }
 
 // ValidateBudget validates settings and resolves every managed model's static
@@ -50,6 +80,9 @@ func ValidateBudget(budget *BudgetConfig, models map[string]ModelConfig) error {
 	}
 	if budget.Eviction.Policy != "lru" {
 		return fmt.Errorf("eviction.policy: unknown policy %q (valid: lru)", budget.Eviction.Policy)
+	}
+	if err := validateBudgetKVCache(&budget.KVCache); err != nil {
+		return fmt.Errorf("kv_cache: %w", err)
 	}
 
 	costModelIDs := make([]string, 0, len(budget.Eviction.EvictCosts))
@@ -90,6 +123,31 @@ func ValidateBudget(budget *BudgetConfig, models map[string]ModelConfig) error {
 		resolved[modelID] = memoryMiB
 	}
 	budget.memoryMiB = resolved
+	return nil
+}
+
+func validateBudgetKVCache(kvCache *BudgetKVCacheConfig) error {
+	if !kvCache.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(kvCache.Directory) == "" {
+		kvCache.Directory = defaultKVCacheDirectory
+	}
+	if kvCache.SaveTimeout == 0 {
+		kvCache.SaveTimeout = defaultKVCacheTimeout
+	}
+	if kvCache.RestoreTimeout == 0 {
+		kvCache.RestoreTimeout = defaultKVCacheTimeout
+	}
+	if kvCache.SaveTimeout < 0 {
+		return fmt.Errorf("save_timeout must be positive, got %s", kvCache.SaveTimeout)
+	}
+	if kvCache.RestoreTimeout < 0 {
+		return fmt.Errorf("restore_timeout must be positive, got %s", kvCache.RestoreTimeout)
+	}
+	if !kvCache.SingleSlotOnly {
+		return fmt.Errorf("single_slot_only must be true; multiple slots are not supported")
+	}
 	return nil
 }
 
