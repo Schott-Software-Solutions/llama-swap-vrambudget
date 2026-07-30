@@ -30,6 +30,9 @@ func NewBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Budg
 	if err != nil {
 		return nil, fmt.Errorf("creating base router: %w", err)
 	}
+	if settings.KVCache.Enabled {
+		base.lifecycle = newKVCacheLifecycle(settings.KVCache, conf.Models, proxylog)
+	}
 
 	for modelID, modelCfg := range conf.Models {
 		procLog := logmon.NewWriter(upstreamlog)

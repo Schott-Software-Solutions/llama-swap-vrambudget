@@ -37,6 +37,7 @@ type baseRouter struct {
 	processes map[string]process.Process
 	logger    *logmon.Monitor
 	schedule  scheduler.Scheduler
+	lifecycle modelLifecycle
 
 	// shutdownCtx governs the request machinery: cancelling it tells grant()
 	// and ServeHTTP to stop granting and reject callers. It is deliberately
@@ -248,6 +249,13 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 		wg.Add(1)
 		go func(p process.Process, id string) {
 			defer wg.Done()
+			// FIFO starts a swap only after every selected victim has drained
+			// its in-flight requests. While this swap is active, new requests
+			// for a victim collide and queue, so the optional hook and Stop
+			// cannot race a serving request.
+			if b.lifecycle != nil {
+				b.lifecycle.BeforeModelStop(b.shutdownCtx, id)
+			}
 			if err := p.Stop(timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
@@ -265,11 +273,17 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
+	wasReady := target.State() == process.StateReady
 	err := target.EnsureReady(b.shutdownCtx, timeout)
 	if err != nil && b.shutdownCtx.Err() == nil {
 		// Quiet during shutdown: every in-flight swap fails at once there, and
 		// that is expected rather than worth a warning per model.
 		b.logger.Warnf("%s: starting %s failed: %v", b.name, modelID, err)
+	}
+	if err == nil && !wasReady && b.lifecycle != nil {
+		// This remains before SwapDone so scheduler waiters cannot receive the
+		// process handler until the hook has completed, timed out, or skipped.
+		b.lifecycle.AfterModelStart(b.shutdownCtx, modelID)
 	}
 
 	select {
