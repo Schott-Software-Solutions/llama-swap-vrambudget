@@ -185,7 +185,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// either style, never both.
 	hasTopLevel := config.Matrix != nil || len(config.Groups) > 0
 	rtr := config.Routing.Router
-	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || len(rtr.Settings.Groups) > 0
+	hasRouting := rtr.Use != "" || rtr.Settings.Matrix != nil || rtr.Settings.Budget != nil || len(rtr.Settings.Groups) > 0
 
 	if hasTopLevel && hasRouting {
 		return Config{}, fmt.Errorf("config uses both the legacy top-level 'matrix'/'groups' keys and the new 'routing.router' block; please migrate the top-level keys into 'routing.router' and remove them")
@@ -201,10 +201,14 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				return Config{}, fmt.Errorf("routing.router.use is 'matrix' but routing.router.settings.matrix is not set")
 			}
 			config.Matrix = rs.Matrix
+		case "budget":
+			if rs.Budget == nil {
+				return Config{}, fmt.Errorf("routing.router.use is 'budget' but routing.router.settings.budget is not set")
+			}
 		case "group", "":
 			config.Groups = rs.Groups
 		default:
-			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix)", config.Routing.Router.Use)
+			return Config{}, fmt.Errorf("routing.router.use: unknown router %q (valid: group, matrix, budget)", config.Routing.Router.Use)
 		}
 	}
 
@@ -213,11 +217,16 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("config cannot use both 'groups' and 'matrix'")
 	}
 
-	if config.Matrix != nil {
+	switch {
+	case config.Routing.Router.Use == "budget":
+		if err := ValidateBudget(config.Routing.Router.Settings.Budget, config.Models); err != nil {
+			return Config{}, fmt.Errorf("budget: %w", err)
+		}
+	case config.Matrix != nil:
 		if err := ValidateMatrix(config.Matrix, config.Models); err != nil {
 			return Config{}, fmt.Errorf("matrix: %w", err)
 		}
-	} else {
+	default:
 		config = AddDefaultGroupToConfig(config)
 
 		// Validate group members
@@ -241,7 +250,9 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	// Build the canonical Config.Routing from the effective result. Both legacy
 	// and new-style configs converge here. The Matrix pointer is shared so the
 	// compiled matrix program stays in one place.
-	if config.Matrix != nil {
+	if config.Routing.Router.Use == "budget" {
+		config.Routing.Router.Use = "budget"
+	} else if config.Matrix != nil {
 		config.Routing.Router.Use = "matrix"
 	} else {
 		config.Routing.Router.Use = "group"

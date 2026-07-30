@@ -38,6 +38,7 @@ type FIFO struct {
 	planner Swapper
 	cfg     config.FifoConfig
 	effects Effects
+	clock   Clock
 
 	limits   map[string]int
 	active   map[string]*activeSwap
@@ -65,6 +66,7 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		planner:  planner,
 		cfg:      cfg,
 		effects:  eff,
+		clock:    realClock{},
 		limits:   limits,
 		active:   make(map[string]*activeSwap),
 		reserved: make(map[string]int),
@@ -193,6 +195,14 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	}
 	delete(s.active, ev.ModelID)
 
+	at := s.clock.Now()
+	for _, modelID := range sw.evict {
+		notifyModelStopped(s.planner, modelID, at)
+	}
+	if ev.Err == nil {
+		notifyModelReady(s.planner, ev.ModelID, at)
+	}
+
 	for _, w := range sw.waiters {
 		if ev.Err != nil {
 			s.grantError(w, ev.Err)
@@ -210,6 +220,7 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
+	notifyServeDone(s.planner, ev.ModelID, s.clock.Now())
 	if s.inFlight[ev.ModelID] <= 0 {
 		delete(s.inFlight, ev.ModelID)
 		s.drainQueue()
@@ -260,6 +271,10 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	// intentionally NOT cleared here: each dying handler will fire its tracked
 	// serve and reach OnServeDone in the normal way.
 	s.effects.StopProcesses(timeout, targets)
+	at := s.clock.Now()
+	for _, modelID := range targets {
+		notifyModelStopped(s.planner, modelID, at)
+	}
 
 	// Removing entries from active above may have unblocked queued requests
 	// that previously collided with the now-cancelled swaps.
@@ -290,6 +305,7 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 
 	if s.effects.GrantServe(req, modelID) {
 		s.inFlight[modelID]++
+		notifyServeStart(s.planner, modelID, s.clock.Now())
 	} else {
 		s.release(modelID)
 	}

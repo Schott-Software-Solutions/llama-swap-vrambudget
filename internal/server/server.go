@@ -158,6 +158,11 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	var err error
 
 	switch cfg.Routing.Router.Use {
+	case "budget":
+		local, err = router.NewBudget(cfg, proxylog, upstreamlog)
+		if err != nil {
+			return nil, fmt.Errorf("creating budget router: %w", err)
+		}
 	case "matrix":
 		local, err = router.NewMatrix(cfg, proxylog, upstreamlog)
 		if err != nil {

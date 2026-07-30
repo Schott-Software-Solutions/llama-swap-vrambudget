@@ -491,7 +491,7 @@ hooks:
 
 # routing:
 # Controls how llama-swap decides which models can run at the same time and
-# which get swapped out. Choose one of two swap engines:
+# which get swapped out. Choose one of three swap engines:
 #
 # - group:  the default engine. Simpler to configure. You define groups of
 #           models that run together, and loading one group typically unloads
@@ -502,12 +502,16 @@ hooks:
 #           model combinations are allowed to run concurrently, enabling
 #           setups that groups cannot express.
 #
+# - budget: keeps any combination whose static memory estimates fit within a
+#           configured budget. When space is needed, the least-recently-used
+#           idle models are evicted. Active requests are never interrupted.
+#
 # The routing section is optional.
 routing:
   router:
     # use: a string defining which engine to use
     # - optional, default: "group"
-    # - valid values: group, matrix
+    # - valid values: group, matrix, budget
     use: group
 
     # settings: a dictionary of settings for the specific engines
@@ -642,6 +646,21 @@ routing:
           # The 70B model uses every GPU, so it can only run alone.
           # Vars are not required when using real model IDs.
           full: "llama-70B"
+
+      # Budget routing reads a positive integer MiB estimate from every model's
+      # metadata (projected_total_mib by default). It keeps models resident
+      # while their combined estimates fit within total_mib - reserve_mib.
+      # This block is ignored unless routing.router.use is "budget".
+      budget:
+        total_mib: 240000
+        reserve_mib: 8000
+        memory_metadata_key: projected_total_mib
+        eviction:
+          policy: lru
+          # Optional costs break otherwise equal LRU choices. Higher values
+          # make a model less attractive to evict; unlisted models use zero.
+          evict_costs:
+            llama: 100
 
   # scheduler: how queued requests are ordered.
   # The default and only valid scheduler is "fifo"

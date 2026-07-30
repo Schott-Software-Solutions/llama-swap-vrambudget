@@ -596,6 +596,51 @@ matrix:
     # vars are not required when using real model IDs
     full: "llama-70B"
 
+# =============================================================================
+# budget: fit concurrent models within a static memory budget
+# =============================================================================
+#
+# Budget routing is configured under routing.router. Every local model managed
+# by this router must provide a positive integer memory estimate in metadata.
+# The effective capacity is total_mib - reserve_mib. Models remain loaded while
+# their combined estimates fit. When a target needs space, idle models are
+# selected by least-recently-used order. A busy victim is considered only when
+# idle models cannot free enough memory; the request then waits until that
+# victim finishes serving.
+#
+# Runtime memory measurement is not used. Leave reserve_mib large enough for
+# operating-system and inference-runtime overhead, KV-cache variation, and
+# estimation error.
+#
+# Activity is reset when the scheduler evicts or explicitly unloads a model.
+# If a model stops autonomously because of its TTL, stale activity is cleared
+# when the next load of that model starts.
+#
+# Example:
+#
+# models:
+#   model-a:
+#     cmd: model-server --port ${PORT} ...
+#     metadata:
+#       projected_total_mib: 64000
+#   model-b:
+#     cmd: model-server --port ${PORT} ...
+#     metadata:
+#       projected_total_mib: 32000
+#
+# routing:
+#   router:
+#     use: budget
+#     settings:
+#       budget:
+#         total_mib: 128000
+#         reserve_mib: 8000
+#         memory_metadata_key: projected_total_mib
+#         eviction:
+#           policy: lru
+#           evict_costs:
+#             model-a: 10
+
 # hooks: a dictionary of event triggers and actions
 # - optional, default: empty dictionary
 # - the only supported hook is on_startup

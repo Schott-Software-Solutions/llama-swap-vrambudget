@@ -155,6 +155,57 @@
                 }
             },
             "additionalProperties": false
+        },
+        "budgetConfig": {
+            "type": "object",
+            "description": "Static memory-budget router settings. Models coexist while their configured estimates fit; otherwise least-recently-used idle models are evicted.",
+            "required": [
+                "total_mib"
+            ],
+            "properties": {
+                "total_mib": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Total memory budget in MiB before subtracting reserve_mib."
+                },
+                "reserve_mib": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Memory in MiB reserved for the operating system, runtime overhead, caches, and estimation error. Must be less than total_mib."
+                },
+                "memory_metadata_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "default": "projected_total_mib",
+                    "description": "Model metadata key containing each managed model's positive integer memory estimate in MiB."
+                },
+                "eviction": {
+                    "type": "object",
+                    "properties": {
+                        "policy": {
+                            "type": "string",
+                            "enum": [
+                                "lru"
+                            ],
+                            "default": "lru",
+                            "description": "Eviction policy. Only least-recently-used (lru) is currently supported."
+                        },
+                        "evict_costs": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "default": {},
+                            "description": "Optional non-negative per-model eviction costs used after LRU ties. Unlisted models default to zero."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {}
+                }
+            },
+            "additionalProperties": false
         }
     },
     "properties": {
@@ -799,16 +850,17 @@
                 },
                 "router": {
                     "type": "object",
-                    "description": "Router configuration. Selects between the group and matrix swapping strategies.",
+                    "description": "Router configuration. Selects between group, matrix, and static memory-budget swapping strategies.",
                     "properties": {
                         "use": {
                             "type": "string",
                             "enum": [
                                 "group",
-                                "matrix"
+                                "matrix",
+                                "budget"
                             ],
                             "default": "group",
-                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix."
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix, and 'budget' uses static per-model memory estimates with LRU eviction."
                         },
                         "settings": {
                             "type": "object",
@@ -818,6 +870,9 @@
                                 },
                                 "matrix": {
                                     "$ref": "#/definitions/matrixConfig"
+                                },
+                                "budget": {
+                                    "$ref": "#/definitions/budgetConfig"
                                 }
                             },
                             "additionalProperties": false
