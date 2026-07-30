@@ -151,3 +151,109 @@ func TestBudget_BusyVictimQueuesUntilServeDone(t *testing.T) {
 		t.Errorf("b.runCalls=%d want 1", got)
 	}
 }
+
+func TestBudget_ConcurrentRequestsShareSingleSwap(t *testing.T) {
+	target := newFakeProcess("target")
+	router := newTestBudget(t, 100, map[string]int{"target": 60}, map[string]process.Process{"target": target})
+
+	const requestCount = 3
+	done := make([]chan struct{}, requestCount)
+	recorders := make([]*httptest.ResponseRecorder, requestCount)
+	for i := range requestCount {
+		done[i] = make(chan struct{})
+		recorders[i] = httptest.NewRecorder()
+		go func(i int) {
+			router.ServeHTTP(recorders[i], newRequest("target"))
+			close(done[i])
+		}(i)
+		waitProcessed(t, router.testProcessed, 1)
+		if i == 0 {
+			waitSignal(t, target.runStarted, "target start")
+		}
+	}
+
+	if got := target.runCalls.Load(); got != 1 {
+		t.Fatalf("target.runCalls=%d want one shared swap", got)
+	}
+	target.markReady()
+	for i := range requestCount {
+		waitSignal(t, done[i], "shared target request")
+		if recorders[i].Code != http.StatusOK {
+			t.Errorf("request %d status=%d body=%q", i, recorders[i].Code, recorders[i].Body.String())
+		}
+	}
+	if got := target.serveCalls.Load(); got != requestCount {
+		t.Errorf("target.serveCalls=%d want %d", got, requestCount)
+	}
+}
+
+func TestBudget_CoexistingSwapTargetsStartInParallel(t *testing.T) {
+	a := newFakeProcess("a")
+	b := newFakeProcess("b")
+	router := newTestBudget(t, 100, map[string]int{"a": 40, "b": 60}, map[string]process.Process{"a": a, "b": b})
+
+	aDone := make(chan struct{})
+	bDone := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), newRequest("a"))
+		close(aDone)
+	}()
+	waitProcessed(t, router.testProcessed, 1)
+	waitSignal(t, a.runStarted, "a start")
+
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), newRequest("b"))
+		close(bDone)
+	}()
+	waitProcessed(t, router.testProcessed, 1)
+	waitSignal(t, b.runStarted, "b parallel start")
+
+	a.markReady()
+	b.markReady()
+	waitSignal(t, aDone, "a request")
+	waitSignal(t, bDone, "b request")
+
+	if got := a.runCalls.Load(); got != 1 {
+		t.Errorf("a.runCalls=%d want 1", got)
+	}
+	if got := b.runCalls.Load(); got != 1 {
+		t.Errorf("b.runCalls=%d want 1", got)
+	}
+}
+
+func TestBudget_ParallelSwapTargetsCannotOvercommit(t *testing.T) {
+	a := newFakeProcess("a")
+	b := newFakeProcess("b")
+	router := newTestBudget(t, 100, map[string]int{"a": 60, "b": 60}, map[string]process.Process{"a": a, "b": b})
+
+	aDone := make(chan struct{})
+	bDone := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), newRequest("a"))
+		close(aDone)
+	}()
+	waitProcessed(t, router.testProcessed, 1)
+	waitSignal(t, a.runStarted, "a start")
+
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), newRequest("b"))
+		close(bDone)
+	}()
+	waitProcessed(t, router.testProcessed, 1)
+
+	select {
+	case <-b.runStarted:
+		t.Fatal("b started in parallel and overcommitted the budget")
+	default:
+	}
+
+	a.markReady()
+	waitSignal(t, aDone, "a request")
+	waitSignal(t, b.runStarted, "b deferred start")
+	b.markReady()
+	waitSignal(t, bDone, "b request")
+
+	if got := a.stopCalls.Load(); got != 1 {
+		t.Errorf("a.stopCalls=%d want 1 before b starts", got)
+	}
+}

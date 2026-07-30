@@ -143,6 +143,14 @@ func TestBudgetSolver_EvictionPlans(t *testing.T) {
 			wantEvict: []string{"a"},
 		},
 		{
+			name:      "missing activity uses deterministic tie-break",
+			budget:    130,
+			memory:    map[string]int{"a": 60, "b": 60, "target": 50},
+			running:   []string{"b", "a"},
+			target:    "target",
+			wantEvict: []string{"a"},
+		},
+		{
 			name:      "target is never evicted",
 			budget:    100,
 			memory:    map[string]int{"a": 60, "target": 60},
