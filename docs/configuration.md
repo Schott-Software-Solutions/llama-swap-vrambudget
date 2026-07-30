@@ -620,11 +620,15 @@ matrix:
 #
 # models:
 #   model-a:
-#     cmd: model-server --port ${PORT} ...
+#     cmd: >-
+#       llama-server --port ${PORT} --model /models/model-a.gguf
+#       --parallel 1 --slot-save-path /var/cache/llama-swap/kvcache
 #     metadata:
 #       projected_total_mib: 64000
 #   model-b:
-#     cmd: model-server --port ${PORT} ...
+#     cmd: >-
+#       llama-server --port ${PORT} --model /models/model-b.gguf
+#       --parallel 1 --slot-save-path /var/cache/llama-swap/kvcache
 #     metadata:
 #       projected_total_mib: 32000
 #
@@ -640,6 +644,43 @@ matrix:
 #           policy: lru
 #           evict_costs:
 #             model-a: 10
+#         kv_cache:
+#           enabled: true
+#           directory: /var/cache/llama-swap/kvcache
+#           save_timeout: 30s
+#           restore_timeout: 30s
+#           single_slot_only: true
+#
+# Optional KV-cache persistence
+#
+# When `kv_cache.enabled` is true, the budget router asks llama-server to save
+# slot 0 before evicting an idle model. After that model is loaded again and
+# passes its health check, the router restores slot 0 before releasing the
+# first queued request. Save and restore are best effort: an unavailable
+# backend, timeout, malformed response, missing file, or incompatible cache is
+# logged but never prevents eviction or serving.
+#
+# The current implementation supports only models whose resolved command
+# explicitly contains both `--parallel 1` (or `-np 1`) and
+# `--slot-save-path <directory>`. Models configured with 2 or 4 slots, without
+# an explicit slot count, or with a different save directory are skipped and
+# logged. The llama-server and llama-swap processes must see the configured
+# directory at the same filesystem path.
+#
+# A successful save creates `<model-id>.bin` plus `<model-id>.json`. The JSON
+# signature records the model ID, model path, context size, parallel count, and
+# K/V cache types. Restore is skipped if any value differs from the current
+# command, which prevents loading a cache built for incompatible settings.
+#
+# The default directory is `/tmp/kvcache`. On many systems `/tmp` is cleared
+# during reboot or container restart, so configure a persistent host directory
+# or volume when caches must survive those events. Cache files can be large;
+# size the filesystem and cleanup policy accordingly.
+#
+# The `/slots/{slot}?action=save|restore` endpoints are llama-server-internal
+# APIs and may change upstream. Incompatibility is handled as a best-effort
+# warning, but llama-swap and llama-server versions should be tested together
+# before deployment.
 
 # hooks: a dictionary of event triggers and actions
 # - optional, default: empty dictionary

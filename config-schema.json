@@ -203,6 +203,44 @@
                     },
                     "additionalProperties": false,
                     "default": {}
+                },
+                "kv_cache": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Best-effort persistence of llama-server slot 0 around budget-router evictions."
+                        },
+                        "directory": {
+                            "type": "string",
+                            "minLength": 1,
+                            "default": "/tmp/kvcache",
+                            "description": "Shared directory used by llama-swap and llama-server for <model-id>.bin cache files and <model-id>.json signatures."
+                        },
+                        "save_timeout": {
+                            "type": "string",
+                            "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
+                            "default": "30s",
+                            "description": "Maximum time to wait for llama-server to save slot 0 before eviction continues."
+                        },
+                        "restore_timeout": {
+                            "type": "string",
+                            "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
+                            "default": "30s",
+                            "description": "Maximum time to wait for llama-server to restore slot 0 before the first queued request is served."
+                        },
+                        "single_slot_only": {
+                            "type": "boolean",
+                            "enum": [
+                                true
+                            ],
+                            "default": true,
+                            "description": "Compatibility guard for the current implementation, which supports only an explicit llama-server --parallel 1."
+                        }
+                    },
+                    "additionalProperties": false,
+                    "default": {}
                 }
             },
             "additionalProperties": false
