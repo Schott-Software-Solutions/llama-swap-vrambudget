@@ -54,7 +54,7 @@ type evictionPlan struct {
 func (s *budgetSolver) Solve(target string, running []string, activity map[string]modelActivity) budgetSolveResult {
 	targetMiB, ok := s.memoryMiB[target]
 	if !ok {
-		return s.conservativeFailure(target, running, 0, fmt.Errorf("no memory estimate for target %q", target))
+		return budgetSolveResult{Error: fmt.Errorf("no memory estimate for target %q", target)}
 	}
 
 	seen := make(map[string]struct{}, len(running))
@@ -68,7 +68,10 @@ func (s *budgetSolver) Solve(target string, running []string, activity map[strin
 		seen[modelID] = struct{}{}
 		memoryMiB, exists := s.memoryMiB[modelID]
 		if !exists {
-			return s.conservativeFailure(target, running, usedMiB, fmt.Errorf("no memory estimate for running model %q", modelID))
+			return budgetSolveResult{
+				UsedMiB: usedMiB,
+				Error:   fmt.Errorf("no memory estimate for running model %q", modelID),
+			}
 		}
 		unique = append(unique, modelID)
 		usedMiB += memoryMiB
@@ -125,9 +128,6 @@ func (s *budgetSolver) Solve(target string, running []string, activity map[strin
 	}
 	if plan == nil {
 		result.Error = fmt.Errorf("running models can free only %d MiB, need %d MiB for target %q", candidateMemory(candidates), requiredMiB, target)
-		result.Evict = candidateIDs(candidates)
-		result.FreedMiB = candidateMemory(candidates)
-		result.IncludesBusy = hasBusy(candidates)
 		return result
 	}
 
@@ -141,23 +141,6 @@ func (s *budgetSolver) Solve(target string, running []string, activity map[strin
 		}
 	}
 	return result
-}
-
-func (s *budgetSolver) conservativeFailure(target string, running []string, usedMiB int, err error) budgetSolveResult {
-	seen := make(map[string]struct{}, len(running))
-	evict := make([]string, 0, len(running))
-	for _, modelID := range running {
-		if modelID == target {
-			continue
-		}
-		if _, duplicate := seen[modelID]; duplicate {
-			continue
-		}
-		seen[modelID] = struct{}{}
-		evict = append(evict, modelID)
-	}
-	sort.Strings(evict)
-	return budgetSolveResult{Evict: evict, UsedMiB: usedMiB, Error: err}
 }
 
 func solveBudgetExhaustive(candidates []budgetCandidate, requiredMiB int) *evictionPlan {
@@ -277,21 +260,4 @@ func candidateMemory(candidates []budgetCandidate) int {
 		total += candidate.memoryMiB
 	}
 	return total
-}
-
-func candidateIDs(candidates []budgetCandidate) []string {
-	result := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		result = append(result, candidate.id)
-	}
-	return result
-}
-
-func hasBusy(candidates []budgetCandidate) bool {
-	for _, candidate := range candidates {
-		if candidate.busy {
-			return true
-		}
-	}
-	return false
 }

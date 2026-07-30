@@ -186,14 +186,25 @@ func TestBudgetSolver_EvictionPlans(t *testing.T) {
 	}
 }
 
-func TestBudgetSolver_UnknownMemoryFailsConservatively(t *testing.T) {
+func TestBudgetSolver_UnknownRunningMemoryFailsWithoutEviction(t *testing.T) {
 	solver := newBudgetSolver(100, map[string]int{"target": 50, "known": 40}, nil)
 	result := solver.Solve("target", []string{"unknown", "known"}, nil)
 	if result.Error == nil {
 		t.Fatal("Solve error=nil want unknown-memory error")
 	}
-	if !slices.Equal(result.Evict, []string{"known", "unknown"}) {
-		t.Errorf("Evict=%v want all running models", result.Evict)
+	if len(result.Evict) != 0 {
+		t.Errorf("Evict=%v want no destructive fallback", result.Evict)
+	}
+}
+
+func TestBudgetSolver_MissingTargetMemoryFailsWithoutEviction(t *testing.T) {
+	solver := newBudgetSolver(100, map[string]int{"known": 40}, nil)
+	result := solver.Solve("target", []string{"known"}, nil)
+	if result.Error == nil {
+		t.Fatal("Solve error=nil want missing-target-memory error")
+	}
+	if len(result.Evict) != 0 {
+		t.Errorf("Evict=%v want no destructive fallback", result.Evict)
 	}
 }
 

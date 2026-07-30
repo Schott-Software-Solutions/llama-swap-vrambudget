@@ -115,6 +115,12 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 
 	running := s.runningSet(req.Model)
 	evict := s.planner.EvictionFor(req.Model, running)
+	if err := swapperPlanningError(s.planner, req.Model, running); err != nil {
+		planningErr := fmt.Errorf("%s: planning swap for model %s: %w", s.name, req.Model, err)
+		s.logger.Errorf("%v", planningErr)
+		s.grantError(req, planningErr)
+		return
+	}
 
 	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
@@ -436,6 +442,12 @@ func (s *FIFO) drainQueue() {
 		}
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
+		if err := swapperPlanningError(s.planner, req.Model, running); err != nil {
+			planningErr := fmt.Errorf("%s: planning swap for model %s: %w", s.name, req.Model, err)
+			s.logger.Errorf("%v", planningErr)
+			s.grantError(req, planningErr)
+			continue
+		}
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
 			s.logger.Debugf("%s: queued request for model %s now served fast-path", s.name, req.Model)
 			s.grantHandler(req, req.Model)

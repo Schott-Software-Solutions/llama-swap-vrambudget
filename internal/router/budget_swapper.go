@@ -51,7 +51,18 @@ func (s *budgetSwapper) solve(target string, running []string) budgetSolveResult
 }
 
 func (s *budgetSwapper) EvictionFor(target string, running []string) []string {
-	return slices.Clone(s.solve(target, running).Evict)
+	result := s.solve(target, running)
+	if result.Error != nil {
+		return nil
+	}
+	return slices.Clone(result.Evict)
+}
+
+// PlanningErrorFor implements scheduler.PlanningErrorSwapper without changing
+// the upstream Swapper contract. The scheduler uses it to reject only the
+// affected request instead of starting a swap from an invalid decision.
+func (s *budgetSwapper) PlanningErrorFor(target string, running []string) error {
+	return s.solve(target, running).Error
 }
 
 func (s *budgetSwapper) OnSwapStart(target string, running []string) {
