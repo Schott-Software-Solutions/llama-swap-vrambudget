@@ -124,7 +124,9 @@ type HandlerResp struct {
 	Err        error
 }
 
-// SwapDone is reported by a swap goroutine when its target is ready (or failed).
+// SwapDone is reported after every selected victim's Process.Stop has returned
+// and the target is ready (or its start failed). Err describes only the target
+// readiness result; victims are already stopped even when Err is non-nil.
 type SwapDone struct {
 	ModelID string
 	Err     error

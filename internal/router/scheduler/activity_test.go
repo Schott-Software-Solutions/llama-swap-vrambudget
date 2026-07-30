@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -87,5 +88,26 @@ func TestFIFO_NonActivitySwapperUnchanged(t *testing.T) {
 
 	if got := effects.served("a"); got != 1 {
 		t.Errorf("served(a)=%d want 1", got)
+	}
+}
+
+func TestFIFO_ActivityVictimsStoppedWhenTargetStartFails(t *testing.T) {
+	planner := &activityPlanner{
+		stubPlanner: stubPlanner{evict: map[string][]string{"target": {"victim"}}},
+	}
+	effects := newFakeEffects()
+	effects.states["target"] = process.StateStopped
+	effects.states["victim"] = process.StateReady
+	scheduler := newFIFO(planner, effects)
+	at := time.Date(2026, 7, 30, 11, 0, 0, 0, time.UTC)
+	scheduler.clock = &fakeClock{now: at}
+
+	scheduler.OnRequest(req("target"))
+	effects.states["victim"] = process.StateStopped
+	scheduler.OnSwapDone(SwapDone{ModelID: "target", Err: errors.New("target failed")})
+
+	want := []activityEvent{{"stopped", "victim", at}}
+	if len(planner.events) != len(want) || planner.events[0] != want[0] {
+		t.Fatalf("events=%v want %v", planner.events, want)
 	}
 }

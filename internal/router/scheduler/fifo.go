@@ -202,6 +202,9 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	delete(s.active, ev.ModelID)
 
 	at := s.clock.Now()
+	// StartSwap reports SwapDone only after Process.Stop has returned for every
+	// victim. SwapDone.Err is the target readiness error, so victims are stopped
+	// and must be removed from activity tracking on both success and failure.
 	for _, modelID := range sw.evict {
 		notifyModelStopped(s.planner, modelID, at)
 	}

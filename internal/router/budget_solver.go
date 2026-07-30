@@ -95,6 +95,9 @@ func (s *budgetSolver) Solve(target string, running []string, activity map[strin
 	}
 
 	candidates := make([]budgetCandidate, 0, len(unique))
+	// Activity is consulted only for IDs in the scheduler-provided running set.
+	// A process that stopped autonomously via TTL disappears from that set, so
+	// its stale activity entry cannot affect accounting or victim selection.
 	for _, modelID := range unique {
 		if modelID == target {
 			continue

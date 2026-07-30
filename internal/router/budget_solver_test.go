@@ -232,6 +232,30 @@ func TestBudgetSolver_GreedyFallbackMinimizesVictims(t *testing.T) {
 	}
 }
 
+func TestBudgetSolver_StaleActivityForStoppedModelIsIgnored(t *testing.T) {
+	base := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
+	solver := newBudgetSolver(100, map[string]int{
+		"running": 50,
+		"stale":   90,
+		"target":  50,
+	}, nil)
+	activity := map[string]modelActivity{
+		"running": {readyAt: base.Add(-time.Hour)},
+		"stale":   {readyAt: base.Add(-24 * time.Hour)},
+	}
+
+	result := solver.Solve("target", []string{"running"}, activity)
+	if result.Error != nil {
+		t.Fatalf("Solve error: %v", result.Error)
+	}
+	if result.UsedMiB != 50 {
+		t.Errorf("UsedMiB=%d want 50; stopped model must not be accounted", result.UsedMiB)
+	}
+	if len(result.Evict) != 0 {
+		t.Errorf("Evict=%v want none; stale activity must not create a victim", result.Evict)
+	}
+}
+
 func BenchmarkBudgetSolver_Subsets(b *testing.B) {
 	memory := make(map[string]int, 12)
 	running := make([]string, 0, 12)

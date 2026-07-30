@@ -255,6 +255,9 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	}
 	wg.Wait()
 
+	// Reaching this point means Process.Stop has returned for every victim.
+	// The Process contract guarantees termination before return; any later
+	// SwapDone error therefore describes target readiness, not victim state.
 	// EnsureReady rather than a State() check followed by Run: the router must
 	// not assume anything about the process. Deciding out here means acting on
 	// a snapshot that the process's own run loop can invalidate at any moment —
