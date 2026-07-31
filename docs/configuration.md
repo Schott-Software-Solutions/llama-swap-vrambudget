@@ -622,13 +622,14 @@ matrix:
 #   model-a:
 #     cmd: >-
 #       llama-server --port ${PORT} --model /models/model-a.gguf
-#       --parallel 1 --slot-save-path /var/cache/llama-swap/kvcache
+#       --parallel 2 --kv-unified
+#       --slot-save-path /var/cache/llama-swap/kvcache
 #     metadata:
 #       projected_total_mib: 64000
 #   model-b:
 #     cmd: >-
 #       llama-server --port ${PORT} --model /models/model-b.gguf
-#       --parallel 1 --slot-save-path /var/cache/llama-swap/kvcache
+#       --parallel 4 --slot-save-path /var/cache/llama-swap/kvcache
 #     metadata:
 #       projected_total_mib: 32000
 #
@@ -649,33 +650,50 @@ matrix:
 #           directory: /var/cache/llama-swap/kvcache
 #           save_timeout: 30s
 #           restore_timeout: 30s
-#           single_slot_only: true
+#           max_parallel_saves: 2
 #
 # Optional KV-cache persistence
 #
 # When `kv_cache.enabled` is true, the budget router asks llama-server to save
-# slot 0 before evicting an idle model. After that model is loaded again and
-# passes its health check, the router restores slot 0 before releasing the
-# first queued request. Save and restore are best effort: an unavailable
-# backend, timeout, malformed response, missing file, or incompatible cache is
-# logged but never prevents eviction or serving.
+# every logical slot before evicting an idle model. After that model is loaded
+# again and passes its health check, the router restores each successfully
+# saved slot into the same slot ID before releasing the first queued request.
+# This also applies with `--kv-unified`: the KV allocation may be unified, but
+# llama-server still exposes logical slots through its slot API. Save and
+# restore are best effort. A failure is logged per slot and never prevents
+# eviction or serving; successful slots remain usable when another slot fails.
 #
-# The current implementation supports only models whose resolved command
-# explicitly contains both `--parallel 1` (or `-np 1`) and
-# `--slot-save-path <directory>`. Models configured with 2 or 4 slots, without
-# an explicit slot count, or with a different save directory are skipped and
-# logged. The llama-server and llama-swap processes must see the configured
-# directory at the same filesystem path.
+# Eligible model commands must explicitly contain `--parallel N` (or `-np N`)
+# with N >= 1 and `--slot-save-path <directory>`. Commands without an explicit
+# slot count or with a different save directory are skipped and logged. The
+# llama-server and llama-swap processes must see that directory at the same
+# filesystem path.
 #
-# A successful save creates `<model-id>.bin` plus `<model-id>.json`. The JSON
-# signature records the model ID, model path, context size, parallel count, and
-# K/V cache types. Restore is skipped if any value differs from the current
-# command, which prevents loading a cache built for incompatible settings.
+# Each successful slot save creates `<model-id>-slot-N.bin`; one atomic,
+# versioned `<model-id>.json` records which files are restorable. Its signature
+# includes model ID, model path, context size, parallel count, K/V cache types,
+# and `kv_unified`. Restore is skipped if any signature value differs. Legacy
+# version-1 `<model-id>.bin` caches remain readable only for `parallel == 1`.
+#
+# `save_timeout` and `restore_timeout` each cover the complete operation for
+# one model, not every slot separately. Saves run with at most
+# `max_parallel_saves` concurrent file writes across all victims (default 2);
+# restores complete within their shared deadline before requests are released.
+# Increase these model-wide deadlines carefully for large contexts or slow
+# storage. The old `single_slot_only` option is accepted for compatibility but
+# ignored.
 #
 # The default directory is `/tmp/kvcache`. On many systems `/tmp` is cleared
 # during reboot or container restart, so configure a persistent host directory
-# or volume when caches must survive those events. Cache files can be large;
-# size the filesystem and cleanup policy accordingly.
+# or volume when caches must survive those events. Slot files can be very large
+# and saving several of them causes substantial disk I/O; size the filesystem,
+# I/O budget, and cleanup policy accordingly.
+#
+# Persisting every slot preserves all loaded slot states across a model swap,
+# but it does not create a hard user/conversation-to-slot mapping. If
+# llama-server assigns requests to slots using LCP/LRU, cache reuse remains
+# heuristic. Guaranteed session affinity additionally requires stable session
+# routing or explicit slot selection.
 #
 # The `/slots/{slot}?action=save|restore` endpoints are llama-server-internal
 # APIs and may change upstream. Incompatibility is handled as a best-effort

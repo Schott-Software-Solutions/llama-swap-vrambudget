@@ -8,7 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,27 +29,32 @@ func testBudgetKVCacheLifecycle(
 	return newKVCacheLifecycle(testKVCacheConfig(directory), models, logger), logger
 }
 
-func writeSlotSaveResponse(w http.ResponseWriter, filename string) {
+func writeSlotSaveResponse(w http.ResponseWriter, slotID int, filename string) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"id_slot":0,"filename":%q}`, filename)
+	fmt.Fprintf(w, `{"id_slot":%d,"filename":%q}`, slotID, filename)
 }
 
-func decodeSlotFilename(w http.ResponseWriter, r *http.Request) (string, bool) {
+func decodeSlotRequest(w http.ResponseWriter, r *http.Request) (int, string, bool) {
+	slotID, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/slots/"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return 0, "", false
+	}
 	var body struct {
 		Filename string `json:"filename"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return "", false
+		return 0, "", false
 	}
-	return body.Filename, true
+	return slotID, body.Filename, true
 }
 
 func TestKVCache_BudgetSavesVictimBeforeStop(t *testing.T) {
 	directory := t.TempDir()
-	var saveCompleted atomic.Bool
+	var savedSlots atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		filename, ok := decodeSlotFilename(w, r)
+		slotID, filename, ok := decodeSlotRequest(w, r)
 		if !ok {
 			return
 		}
@@ -58,8 +66,8 @@ func TestKVCache_BudgetSavesVictimBeforeStop(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		saveCompleted.Store(true)
-		writeSlotSaveResponse(w, filename)
+		savedSlots.Add(1)
+		writeSlotSaveResponse(w, slotID, filename)
 	}))
 	t.Cleanup(server.Close)
 
@@ -67,7 +75,7 @@ func TestKVCache_BudgetSavesVictimBeforeStop(t *testing.T) {
 	victim.markReady()
 	var stoppedBeforeSave atomic.Bool
 	victim.onStop = func(string) {
-		if !saveCompleted.Load() {
+		if savedSlots.Load() != 2 {
 			stoppedBeforeSave.Store(true)
 		}
 	}
@@ -78,7 +86,7 @@ func TestKVCache_BudgetSavesVictimBeforeStop(t *testing.T) {
 		"target": target,
 	})
 	lifecycle, _ := testBudgetKVCacheLifecycle(directory, map[string]config.ModelConfig{
-		"victim": testKVCacheModel(directory, server.URL, 1),
+		"victim": testKVCacheModel(directory, server.URL, 2),
 		"target": testKVCacheModel(directory, server.URL, 2),
 	})
 	router.lifecycle = lifecycle
@@ -89,8 +97,8 @@ func TestKVCache_BudgetSavesVictimBeforeStop(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
-	if !saveCompleted.Load() {
-		t.Fatal("victim cache was not saved")
+	if got := savedSlots.Load(); got != 2 {
+		t.Fatalf("saved slots=%d want 2", got)
 	}
 	if stoppedBeforeSave.Load() {
 		t.Fatal("victim Stop ran before its cache save completed")
@@ -177,19 +185,25 @@ func TestKVCache_BudgetRestoreGatesFirstRequest(t *testing.T) {
 	directory := t.TempDir()
 	restoreStarted := make(chan struct{})
 	restoreRelease := make(chan struct{})
+	var restoreStartOnce sync.Once
+	var restoredMu sync.Mutex
+	var restoredSlots []int
 	var target *fakeProcess
 	var restoredBeforeReady atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		filename, ok := decodeSlotFilename(w, r)
+		slotID, filename, ok := decodeSlotRequest(w, r)
 		if !ok {
 			return
 		}
 		if target.State() != process.StateReady {
 			restoredBeforeReady.Store(true)
 		}
-		close(restoreStarted)
+		restoredMu.Lock()
+		restoredSlots = append(restoredSlots, slotID)
+		restoredMu.Unlock()
+		restoreStartOnce.Do(func() { close(restoreStarted) })
 		<-restoreRelease
-		writeSlotSaveResponse(w, filename)
+		writeSlotSaveResponse(w, slotID, filename)
 	}))
 	t.Cleanup(server.Close)
 	t.Cleanup(func() {
@@ -204,7 +218,7 @@ func TestKVCache_BudgetRestoreGatesFirstRequest(t *testing.T) {
 	target.autoReady = true
 	router := newTestBudget(t, 100, map[string]int{"target": 60}, map[string]process.Process{"target": target})
 	lifecycle, _ := testBudgetKVCacheLifecycle(directory, map[string]config.ModelConfig{
-		"target": testKVCacheModel(directory, server.URL, 1),
+		"target": testKVCacheModel(directory, server.URL, 2),
 	})
 	writeTestKVCache(t, lifecycle, "target", lifecycle.models["target"].signature)
 	router.lifecycle = lifecycle
@@ -236,6 +250,13 @@ func TestKVCache_BudgetRestoreGatesFirstRequest(t *testing.T) {
 	}
 	if got := target.serveCalls.Load(); got != 1 {
 		t.Errorf("target.serveCalls=%d want 1", got)
+	}
+	restoredMu.Lock()
+	sort.Ints(restoredSlots)
+	gotRestored := append([]int(nil), restoredSlots...)
+	restoredMu.Unlock()
+	if fmt.Sprint(gotRestored) != "[0 1]" {
+		t.Errorf("restored slots=%v want [0 1]", gotRestored)
 	}
 }
 
@@ -269,7 +290,9 @@ func TestKVCache_BudgetRestoreFailureStillServes(t *testing.T) {
 func TestKVCache_BudgetRestoreTimeoutStillServes(t *testing.T) {
 	directory := t.TempDir()
 	release := make(chan struct{})
+	var restoreCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		restoreCalls.Add(1)
 		<-release
 	}))
 	t.Cleanup(server.Close)
@@ -279,7 +302,7 @@ func TestKVCache_BudgetRestoreTimeoutStillServes(t *testing.T) {
 	target.autoReady = true
 	router := newTestBudget(t, 100, map[string]int{"target": 60}, map[string]process.Process{"target": target})
 	lifecycle, logger := testBudgetKVCacheLifecycle(directory, map[string]config.ModelConfig{
-		"target": testKVCacheModel(directory, server.URL, 1),
+		"target": testKVCacheModel(directory, server.URL, 2),
 	})
 	lifecycle.config.RestoreTimeout = 25 * time.Millisecond
 	writeTestKVCache(t, lifecycle, "target", lifecycle.models["target"].signature)
@@ -293,6 +316,11 @@ func TestKVCache_BudgetRestoreTimeoutStillServes(t *testing.T) {
 	}
 	if history := string(logger.GetHistory()); !strings.Contains(history, "context deadline exceeded") {
 		t.Errorf("missing timeout log: %q", history)
+	} else if !strings.Contains(history, "restore complete model=target restored=0 failed=2") {
+		t.Errorf("missing model-wide timeout summary: %q", history)
+	}
+	if got := restoreCalls.Load(); got != 1 {
+		t.Errorf("restore HTTP calls=%d want 1; later slots should observe the shared timeout", got)
 	}
 }
 
@@ -300,7 +328,7 @@ func TestKVCache_BudgetDoesNotSaveBusyVictim(t *testing.T) {
 	directory := t.TempDir()
 	var saveCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		filename, ok := decodeSlotFilename(w, r)
+		slotID, filename, ok := decodeSlotRequest(w, r)
 		if !ok {
 			return
 		}
@@ -309,7 +337,7 @@ func TestKVCache_BudgetDoesNotSaveBusyVictim(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeSlotSaveResponse(w, filename)
+		writeSlotSaveResponse(w, slotID, filename)
 	}))
 	t.Cleanup(server.Close)
 

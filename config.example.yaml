@@ -663,13 +663,15 @@ routing:
             llama: 100
         # Optional best-effort llama-server slot-cache persistence. Enabling
         # this also requires each eligible model command to use explicit
-        # "--parallel 1 --slot-save-path /tmp/kvcache" flags.
+        # "--parallel N --slot-save-path /tmp/kvcache" flags. All N slots are
+        # saved separately, including when --kv-unified is enabled.
         kv_cache:
           enabled: false
           directory: /tmp/kvcache
           save_timeout: 30s
           restore_timeout: 30s
-          single_slot_only: true
+          # Limit simultaneous large slot-file writes. Default: 2.
+          max_parallel_saves: 2
 
   # scheduler: how queued requests are ordered.
   # The default and only valid scheduler is "fifo"

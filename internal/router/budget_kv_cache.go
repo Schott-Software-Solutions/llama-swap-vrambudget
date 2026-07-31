@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -25,6 +26,24 @@ type kvCacheLifecycle struct {
 	models map[string]kvCacheModel
 	logger *logmon.Monitor
 	client *http.Client
+
+	// Shared by every concurrent victim save so max_parallel_saves caps total
+	// cache-file I/O, not just the slots of one model.
+	saveSemaphore chan struct{}
+}
+
+type slotActionResponse struct {
+	IDSlot    *int    `json:"id_slot"`
+	Filename  *string `json:"filename"`
+	NSaved    *int    `json:"n_saved"`
+	NRestored *int    `json:"n_restored"`
+}
+
+type slotSaveResult struct {
+	metadata kvCacheSlotMetadata
+	duration time.Duration
+	empty    bool
+	err      error
 }
 
 func newKVCacheLifecycle(settings config.BudgetKVCacheConfig, models map[string]config.ModelConfig, logger *logmon.Monitor) *kvCacheLifecycle {
@@ -32,11 +51,16 @@ func newKVCacheLifecycle(settings config.BudgetKVCacheConfig, models map[string]
 	for modelID, model := range models {
 		inspected[modelID] = inspectKVCacheModel(modelID, model, settings.Directory)
 	}
+	saveLimit := settings.MaxParallelSaves
+	if saveLimit < 1 {
+		saveLimit = 1
+	}
 	return &kvCacheLifecycle{
-		config: settings,
-		models: inspected,
-		logger: logger,
-		client: &http.Client{},
+		config:        settings,
+		models:        inspected,
+		logger:        logger,
+		client:        &http.Client{},
+		saveSemaphore: make(chan struct{}, saveLimit),
 	}
 }
 
@@ -50,41 +74,126 @@ func (l *kvCacheLifecycle) BeforeModelStop(parent context.Context, modelID strin
 		return
 	}
 
-	finalFilename := modelID + ".bin"
-	tempFilename := finalFilename + ".tmp"
-	tempPath := filepath.Join(l.config.Directory, tempFilename)
-	finalPath := filepath.Join(l.config.Directory, finalFilename)
 	metadataPath := filepath.Join(l.config.Directory, modelID+".json")
+	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+		// Do not replace any slot files while stale metadata could remain and
+		// describe a mixture of cache generations.
+		l.logger.Warnf("kv-cache: save failed model=%s error=invalidating old metadata: %v", modelID, err)
+		return
+	}
+
+	started := time.Now()
+	l.logger.Infof("kv-cache: saving model=%s slots=%d", modelID, model.signature.Parallel)
+	ctx, cancel := context.WithTimeout(parent, l.config.SaveTimeout)
+	defer cancel()
+
+	results := l.saveSlots(ctx, modelID, model)
+	metadataSlots := make([]kvCacheSlotMetadata, len(results))
+	saved, failed, empty := 0, 0, 0
+	for slotID, result := range results {
+		metadataSlots[slotID] = result.metadata
+		finalPath := filepath.Join(l.config.Directory, result.metadata.Filename)
+		switch {
+		case result.err != nil:
+			failed++
+			l.logger.Warnf("kv-cache: save failed model=%s slot=%d error=%v", modelID, slotID, result.err)
+		case result.metadata.Saved:
+			saved++
+			if result.empty {
+				empty++
+				l.logger.Infof("kv-cache: saved model=%s slot=%d file=%s empty=true duration=%s",
+					modelID, slotID, finalPath, result.duration.Round(time.Millisecond))
+				break
+			}
+			l.logger.Infof("kv-cache: saved model=%s slot=%d file=%s duration=%s",
+				modelID, slotID, finalPath, result.duration.Round(time.Millisecond))
+		default:
+			empty++
+			l.logger.Infof("kv-cache: skipped save model=%s slot=%d reason=empty-slot", modelID, slotID)
+		}
+	}
+
+	metadata := newKVCacheMetadata(model.signature, metadataSlots)
+	if err := writeMetadataAtomically(metadataPath, metadata); err != nil {
+		// The previous generation was invalidated before slot publication, so
+		// none of the just-published binaries can be restored without this file.
+		l.logger.Warnf("kv-cache: save metadata failed model=%s error=%v", modelID, err)
+	}
+	if err := cleanupObsoleteSlotFiles(l.config.Directory, modelID, model.signature.Parallel); err != nil {
+		l.logger.Warnf("kv-cache: stale slot cleanup failed model=%s error=%v", modelID, err)
+	}
+
+	l.logger.Infof("kv-cache: save complete model=%s saved=%d failed=%d empty=%d duration=%s",
+		modelID, saved, failed, empty, time.Since(started).Round(time.Millisecond))
+}
+
+func (l *kvCacheLifecycle) saveSlots(ctx context.Context, modelID string, model kvCacheModel) []slotSaveResult {
+	results := make([]slotSaveResult, model.signature.Parallel)
+
+	var wg sync.WaitGroup
+	for slotID := range model.signature.Parallel {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := slotSaveResult{
+				metadata: kvCacheSlotMetadata{
+					SlotID:   slotID,
+					Filename: kvCacheSlotFilename(modelID, slotID),
+				},
+			}
+			select {
+			case l.saveSemaphore <- struct{}{}:
+				defer func() { <-l.saveSemaphore }()
+			case <-ctx.Done():
+				result.err = ctx.Err()
+				results[slotID] = result
+				return
+			}
+			results[slotID] = l.saveSlot(ctx, model, result.metadata)
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func (l *kvCacheLifecycle) saveSlot(ctx context.Context, model kvCacheModel, metadata kvCacheSlotMetadata) slotSaveResult {
+	result := slotSaveResult{metadata: metadata}
+	tempFilename := metadata.Filename + ".tmp"
+	tempPath := filepath.Join(l.config.Directory, tempFilename)
+	finalPath := filepath.Join(l.config.Directory, metadata.Filename)
 	_ = os.Remove(tempPath)
 	defer os.Remove(tempPath)
 
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(parent, l.config.SaveTimeout)
-	defer cancel()
-	if err := l.slotAction(ctx, model, "save", tempFilename); err != nil {
-		l.logger.Warnf("kv-cache: save failed model=%s error=%v", modelID, err)
-		return
+	response, err := l.slotAction(ctx, model, metadata.SlotID, "save", tempFilename)
+	result.duration = time.Since(started)
+	if err != nil {
+		result.err = err
+		return result
 	}
-	if info, err := os.Stat(tempPath); err != nil {
-		l.logger.Warnf("kv-cache: save failed model=%s error=cache file %s unavailable after save: %v", modelID, tempPath, err)
-		return
-	} else if !info.Mode().IsRegular() {
-		l.logger.Warnf("kv-cache: save failed model=%s error=cache file %s is not regular", modelID, tempPath)
-		return
+	result.empty = response.NSaved != nil && *response.NSaved == 0
+
+	info, err := os.Lstat(tempPath)
+	if err != nil {
+		if result.empty && os.IsNotExist(err) {
+			// Some llama-server versions acknowledge an empty slot without
+			// materializing a file. This is a successful skip, not a model-level
+			// save failure.
+			return result
+		}
+		result.err = fmt.Errorf("cache file %s unavailable after save: %w", tempPath, err)
+		return result
+	}
+	if !info.Mode().IsRegular() {
+		result.err = fmt.Errorf("cache file %s is not regular", tempPath)
+		return result
 	}
 	if err := replaceFile(tempPath, finalPath); err != nil {
-		l.logger.Warnf("kv-cache: save failed model=%s error=publishing cache file: %v", modelID, err)
-		return
+		result.err = fmt.Errorf("publishing cache file: %w", err)
+		return result
 	}
-	if err := writeSignatureAtomically(metadataPath, model.signature); err != nil {
-		// Without fresh metadata the binary must not be considered restorable.
-		_ = os.Remove(metadataPath)
-		l.logger.Warnf("kv-cache: save failed model=%s error=writing metadata: %v", modelID, err)
-		return
-	}
-
-	l.logger.Infof("kv-cache: saved model=%s slot=0 file=%s duration=%s",
-		modelID, finalPath, time.Since(started).Round(time.Millisecond))
+	result.metadata.Saved = true
+	return result
 }
 
 func (l *kvCacheLifecycle) AfterModelStart(parent context.Context, modelID string) {
@@ -93,38 +202,70 @@ func (l *kvCacheLifecycle) AfterModelStart(parent context.Context, modelID strin
 		return
 	}
 
-	filename := modelID + ".bin"
-	cachePath := filepath.Join(l.config.Directory, filename)
 	metadataPath := filepath.Join(l.config.Directory, modelID+".json")
-	if _, err := os.Stat(cachePath); err != nil {
+	metadata, err := readKVCacheMetadata(metadataPath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			l.logger.Debugf("kv-cache: skipped restore model=%s reason=cache-missing", modelID)
 		} else {
-			l.logger.Warnf("kv-cache: skipped restore model=%s reason=cache-stat error=%v", modelID, err)
+			l.logger.Warnf("kv-cache: skipped restore model=%s reason=metadata-invalid error=%v", modelID, err)
 		}
 		return
 	}
-
-	cached, err := readSignature(metadataPath)
-	if err != nil {
-		l.logger.Warnf("kv-cache: skipped restore model=%s reason=metadata-invalid error=%v", modelID, err)
-		return
-	}
-	if field, cachedValue, currentValue, mismatch := signatureMismatch(cached, model.signature); mismatch {
+	if field, cachedValue, currentValue, mismatch := signatureMismatch(metadata.signature(), model.signature); mismatch {
 		l.logger.Warnf("kv-cache: skipped restore model=%s reason=config-mismatch field=%s cached=%s current=%s",
 			modelID, field, cachedValue, currentValue)
 		return
 	}
 
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(parent, l.config.RestoreTimeout)
-	defer cancel()
-	if err := l.slotAction(ctx, model, "restore", filename); err != nil {
-		l.logger.Warnf("kv-cache: restore failed model=%s error=%v", modelID, err)
+	slots := make([]kvCacheSlotMetadata, 0, len(metadata.Slots))
+	for _, slot := range metadata.Slots {
+		if slot.Saved {
+			slots = append(slots, slot)
+		}
+	}
+	if len(slots) == 0 {
+		l.logger.Debugf("kv-cache: skipped restore model=%s reason=no-saved-slots", modelID)
 		return
 	}
-	l.logger.Infof("kv-cache: restored model=%s slot=0 file=%s duration=%s",
-		modelID, cachePath, time.Since(started).Round(time.Millisecond))
+
+	started := time.Now()
+	l.logger.Infof("kv-cache: restoring model=%s slots=%d", modelID, len(slots))
+	ctx, cancel := context.WithTimeout(parent, l.config.RestoreTimeout)
+	defer cancel()
+
+	restored, failed := 0, 0
+	for _, slot := range slots {
+		cachePath := filepath.Join(l.config.Directory, slot.Filename)
+		if ctx.Err() != nil {
+			failed++
+			l.logger.Warnf("kv-cache: restore failed model=%s slot=%d error=%v", modelID, slot.SlotID, ctx.Err())
+			continue
+		}
+		if info, statErr := os.Lstat(cachePath); statErr != nil {
+			failed++
+			l.logger.Warnf("kv-cache: restore failed model=%s slot=%d error=cache file unavailable: %v",
+				modelID, slot.SlotID, statErr)
+			continue
+		} else if !info.Mode().IsRegular() {
+			failed++
+			l.logger.Warnf("kv-cache: restore failed model=%s slot=%d error=cache file is not regular", modelID, slot.SlotID)
+			continue
+		}
+
+		slotStarted := time.Now()
+		if _, restoreErr := l.slotAction(ctx, model, slot.SlotID, "restore", slot.Filename); restoreErr != nil {
+			failed++
+			l.logger.Warnf("kv-cache: restore failed model=%s slot=%d error=%v", modelID, slot.SlotID, restoreErr)
+			continue
+		}
+		restored++
+		l.logger.Infof("kv-cache: restored model=%s slot=%d file=%s duration=%s",
+			modelID, slot.SlotID, cachePath, time.Since(slotStarted).Round(time.Millisecond))
+	}
+
+	l.logger.Infof("kv-cache: restore complete model=%s restored=%d failed=%d duration=%s",
+		modelID, restored, failed, time.Since(started).Round(time.Millisecond))
 }
 
 func (l *kvCacheLifecycle) usableModel(modelID string) (kvCacheModel, bool) {
@@ -140,102 +281,57 @@ func (l *kvCacheLifecycle) usableModel(modelID string) (kvCacheModel, bool) {
 	return model, true
 }
 
-func (l *kvCacheLifecycle) slotAction(ctx context.Context, model kvCacheModel, action, filename string) error {
-	endpoint := slotEndpoint(model.backend, action)
+func (l *kvCacheLifecycle) slotAction(ctx context.Context, model kvCacheModel, slotID int, action, filename string) (slotActionResponse, error) {
+	endpoint := slotEndpoint(model.backend, slotID, action)
 	body, err := json.Marshal(map[string]string{"filename": filename})
 	if err != nil {
-		return err
+		return slotActionResponse{}, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return slotActionResponse{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := l.client.Do(request)
 	if err != nil {
-		return err
+		return slotActionResponse{}, err
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxSlotResponseBytes))
 	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
+		return slotActionResponse{}, fmt.Errorf("reading response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("POST %s returned HTTP %d: %s", endpoint, response.StatusCode, strings.TrimSpace(string(responseBody)))
+		return slotActionResponse{}, fmt.Errorf("POST %s returned HTTP %d: %s", endpoint, response.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 
-	var payload map[string]json.RawMessage
+	var payload slotActionResponse
 	if err := json.Unmarshal(responseBody, &payload); err != nil {
-		return fmt.Errorf("invalid JSON response: %w", err)
+		return slotActionResponse{}, fmt.Errorf("invalid JSON response: %w", err)
 	}
-	var slotID int
-	if raw, exists := payload["id_slot"]; !exists {
-		return fmt.Errorf("invalid JSON response: missing id_slot")
-	} else if err := json.Unmarshal(raw, &slotID); err != nil || slotID != 0 {
-		return fmt.Errorf("invalid JSON response: unexpected id_slot")
+	if payload.IDSlot == nil {
+		return slotActionResponse{}, fmt.Errorf("invalid JSON response: missing id_slot")
 	}
-	var returnedFilename string
-	if raw, exists := payload["filename"]; !exists {
-		return fmt.Errorf("invalid JSON response: missing filename")
-	} else if err := json.Unmarshal(raw, &returnedFilename); err != nil || returnedFilename != filename {
-		return fmt.Errorf("invalid JSON response: unexpected filename")
+	if *payload.IDSlot != slotID {
+		return slotActionResponse{}, fmt.Errorf("invalid JSON response: unexpected id_slot %d", *payload.IDSlot)
 	}
-	return nil
+	if payload.Filename == nil {
+		return slotActionResponse{}, fmt.Errorf("invalid JSON response: missing filename")
+	}
+	if *payload.Filename != filename {
+		return slotActionResponse{}, fmt.Errorf("invalid JSON response: unexpected filename %q", *payload.Filename)
+	}
+	return payload, nil
 }
 
-func slotEndpoint(backend *url.URL, action string) string {
+func slotEndpoint(backend *url.URL, slotID int, action string) string {
 	endpoint := *backend
-	endpoint.Path = "/slots/0"
+	endpoint.Path = fmt.Sprintf("/slots/%d", slotID)
 	endpoint.RawPath = ""
 	endpoint.RawQuery = "action=" + url.QueryEscape(action)
 	endpoint.Fragment = ""
 	return endpoint.String()
-}
-
-func readSignature(path string) (kvCacheSignature, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return kvCacheSignature{}, err
-	}
-	var signature kvCacheSignature
-	if err := json.Unmarshal(data, &signature); err != nil {
-		return kvCacheSignature{}, err
-	}
-	return signature, nil
-}
-
-func writeSignatureAtomically(path string, signature kvCacheSignature) error {
-	data, err := json.MarshalIndent(signature, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-
-	directory := filepath.Dir(path)
-	temp, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-
-	if err := temp.Chmod(0o600); err != nil {
-		temp.Close()
-		return err
-	}
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return replaceFile(tempPath, path)
 }
 
 func replaceFile(source, destination string) error {

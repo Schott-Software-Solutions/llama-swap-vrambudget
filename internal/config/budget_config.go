@@ -13,6 +13,7 @@ import (
 const defaultBudgetMemoryMetadataKey = "projected_total_mib"
 const defaultKVCacheDirectory = "/tmp/kvcache"
 const defaultKVCacheTimeout = 30 * time.Second
+const defaultKVCacheMaxParallelSaves = 2
 
 // BudgetConfig configures the memory-budget router.
 type BudgetConfig struct {
@@ -32,22 +33,25 @@ type BudgetEvictionConfig struct {
 }
 
 // BudgetKVCacheConfig controls best-effort llama-server slot persistence.
-// Phase one deliberately supports only a single slot per model.
 type BudgetKVCacheConfig struct {
-	Enabled        bool          `yaml:"enabled"`
-	Directory      string        `yaml:"directory"`
-	SaveTimeout    time.Duration `yaml:"save_timeout"`
-	RestoreTimeout time.Duration `yaml:"restore_timeout"`
-	SingleSlotOnly bool          `yaml:"single_slot_only"`
+	Enabled          bool          `yaml:"enabled"`
+	Directory        string        `yaml:"directory"`
+	SaveTimeout      time.Duration `yaml:"save_timeout"`
+	RestoreTimeout   time.Duration `yaml:"restore_timeout"`
+	MaxParallelSaves int           `yaml:"max_parallel_saves"`
+
+	// SingleSlotOnly is retained so existing configurations still parse. It is
+	// deprecated and ignored now that every explicitly configured slot is saved.
+	SingleSlotOnly bool `yaml:"single_slot_only"`
 }
 
 func (c *BudgetKVCacheConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type rawBudgetKVCacheConfig BudgetKVCacheConfig
 	defaults := rawBudgetKVCacheConfig{
-		Directory:      defaultKVCacheDirectory,
-		SaveTimeout:    defaultKVCacheTimeout,
-		RestoreTimeout: defaultKVCacheTimeout,
-		SingleSlotOnly: true,
+		Directory:        defaultKVCacheDirectory,
+		SaveTimeout:      defaultKVCacheTimeout,
+		RestoreTimeout:   defaultKVCacheTimeout,
+		MaxParallelSaves: defaultKVCacheMaxParallelSaves,
 	}
 	if err := unmarshal(&defaults); err != nil {
 		return err
@@ -139,14 +143,17 @@ func validateBudgetKVCache(kvCache *BudgetKVCacheConfig) error {
 	if kvCache.RestoreTimeout == 0 {
 		kvCache.RestoreTimeout = defaultKVCacheTimeout
 	}
+	if kvCache.MaxParallelSaves == 0 {
+		kvCache.MaxParallelSaves = defaultKVCacheMaxParallelSaves
+	}
 	if kvCache.SaveTimeout < 0 {
 		return fmt.Errorf("save_timeout must be positive, got %s", kvCache.SaveTimeout)
 	}
 	if kvCache.RestoreTimeout < 0 {
 		return fmt.Errorf("restore_timeout must be positive, got %s", kvCache.RestoreTimeout)
 	}
-	if !kvCache.SingleSlotOnly {
-		return fmt.Errorf("single_slot_only must be true; multiple slots are not supported")
+	if kvCache.MaxParallelSaves < 0 {
+		return fmt.Errorf("max_parallel_saves must be positive, got %d", kvCache.MaxParallelSaves)
 	}
 	return nil
 }

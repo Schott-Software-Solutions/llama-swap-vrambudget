@@ -1,7 +1,6 @@
 package router
 
 import (
-	"fmt"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -17,6 +16,7 @@ type kvCacheSignature struct {
 	Parallel    int    `json:"parallel"`
 	CacheTypeK  string `json:"cache_type_k"`
 	CacheTypeV  string `json:"cache_type_v"`
+	KVUnified   bool   `json:"kv_unified"`
 }
 
 type kvCacheModel struct {
@@ -43,19 +43,15 @@ func inspectKVCacheModel(modelID string, model config.ModelConfig, directory str
 
 	parallelValue, ok := commandFlag(args, "--parallel", "-np")
 	if !ok {
-		result.skipReason = "parallel-slots"
+		result.skipReason = "parallel-count"
 		return result
 	}
 	parallel, err := strconv.Atoi(parallelValue)
 	if err != nil || parallel < 1 {
-		result.skipReason = "parallel-slots"
+		result.skipReason = "parallel-count"
 		return result
 	}
 	result.signature.Parallel = parallel
-	if parallel != 1 {
-		result.skipReason = "parallel-slots"
-		return result
-	}
 
 	slotSavePath, ok := commandFlag(args, "--slot-save-path")
 	if !ok || filepath.Clean(slotSavePath) != filepath.Clean(directory) {
@@ -72,8 +68,12 @@ func inspectKVCacheModel(modelID string, model config.ModelConfig, directory str
 		}
 		result.signature.ContextSize = contextSize
 	}
-	result.signature.CacheTypeK, _ = commandFlag(args, "--cache-type-k")
-	result.signature.CacheTypeV, _ = commandFlag(args, "--cache-type-v")
+	result.signature.CacheTypeK, _ = commandFlag(args, "--cache-type-k", "-ctk")
+	result.signature.CacheTypeV, _ = commandFlag(args, "--cache-type-v", "-ctv")
+	result.signature.KVUnified = commandBoolFlag(args,
+		[]string{"--kv-unified", "-kvu"},
+		[]string{"--no-kv-unified", "-no-kvu"},
+	)
 
 	backend, err := url.Parse(model.Proxy)
 	if err != nil || (backend.Scheme != "http" && backend.Scheme != "https") || backend.Host == "" {
@@ -83,6 +83,22 @@ func inspectKVCacheModel(modelID string, model config.ModelConfig, directory str
 	result.backend = backend
 	result.eligible = true
 	return result
+}
+
+func commandBoolFlag(args []string, enabledNames, disabledNames []string) bool {
+	for i := len(args) - 1; i >= 0; i-- {
+		for _, name := range enabledNames {
+			if args[i] == name {
+				return true
+			}
+		}
+		for _, name := range disabledNames {
+			if args[i] == name {
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func commandFlag(args []string, names ...string) (string, bool) {
@@ -121,6 +137,7 @@ func signatureMismatch(cached, current kvCacheSignature) (field, cachedValue, cu
 		{"parallel", strconv.Itoa(cached.Parallel), strconv.Itoa(current.Parallel)},
 		{"cache_type_k", cached.CacheTypeK, current.CacheTypeK},
 		{"cache_type_v", cached.CacheTypeV, current.CacheTypeV},
+		{"kv_unified", strconv.FormatBool(cached.KVUnified), strconv.FormatBool(current.KVUnified)},
 	}
 	for _, candidate := range fields {
 		if candidate.cached != candidate.current {
@@ -131,8 +148,5 @@ func signatureMismatch(cached, current kvCacheSignature) (field, cachedValue, cu
 }
 
 func (m kvCacheModel) skipLog(modelID string) string {
-	if m.skipReason == "parallel-slots" {
-		return fmt.Sprintf("kv-cache: skipping model=%s reason=parallel-slots count=%d", modelID, m.signature.Parallel)
-	}
-	return fmt.Sprintf("kv-cache: skipping model=%s reason=%s", modelID, m.skipReason)
+	return "kv-cache: skipping model=" + modelID + " reason=" + m.skipReason
 }

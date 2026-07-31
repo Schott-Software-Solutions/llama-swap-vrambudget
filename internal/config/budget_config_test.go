@@ -152,14 +152,17 @@ routing:
 		t.Errorf("budget config unexpectedly normalized groups=%v matrix=%v", cfg.Groups, cfg.Matrix)
 	}
 	kvCache := cfg.Routing.Router.Settings.Budget.KVCache
-	if !kvCache.Enabled || !kvCache.SingleSlotOnly {
-		t.Errorf("KVCache=%+v want enabled single-slot defaults", kvCache)
+	if !kvCache.Enabled {
+		t.Errorf("KVCache=%+v want enabled", kvCache)
 	}
 	if kvCache.Directory != "/tmp/kvcache" {
 		t.Errorf("KVCache.Directory=%q want /tmp/kvcache", kvCache.Directory)
 	}
 	if kvCache.SaveTimeout != 30*time.Second || kvCache.RestoreTimeout != 30*time.Second {
 		t.Errorf("KVCache timeouts save=%s restore=%s want 30s", kvCache.SaveTimeout, kvCache.RestoreTimeout)
+	}
+	if kvCache.MaxParallelSaves != 2 {
+		t.Errorf("KVCache.MaxParallelSaves=%d want 2", kvCache.MaxParallelSaves)
 	}
 }
 
@@ -172,16 +175,14 @@ func TestValidateBudget_KVCache(t *testing.T) {
 		{
 			name: "programmatic defaults",
 			kvCache: BudgetKVCacheConfig{
-				Enabled:        true,
-				SingleSlotOnly: true,
+				Enabled: true,
 			},
 		},
 		{
 			name: "negative save timeout",
 			kvCache: BudgetKVCacheConfig{
-				Enabled:        true,
-				SaveTimeout:    -time.Second,
-				SingleSlotOnly: true,
+				Enabled:     true,
+				SaveTimeout: -time.Second,
 			},
 			wantErr: "save_timeout",
 		},
@@ -190,14 +191,23 @@ func TestValidateBudget_KVCache(t *testing.T) {
 			kvCache: BudgetKVCacheConfig{
 				Enabled:        true,
 				RestoreTimeout: -time.Second,
-				SingleSlotOnly: true,
 			},
 			wantErr: "restore_timeout",
 		},
 		{
-			name:    "multiple slots unsupported",
-			kvCache: BudgetKVCacheConfig{Enabled: true},
-			wantErr: "single_slot_only",
+			name: "deprecated single slot false is ignored",
+			kvCache: BudgetKVCacheConfig{
+				Enabled:        true,
+				SingleSlotOnly: false,
+			},
+		},
+		{
+			name: "negative max parallel saves",
+			kvCache: BudgetKVCacheConfig{
+				Enabled:          true,
+				MaxParallelSaves: -1,
+			},
+			wantErr: "max_parallel_saves",
 		},
 	}
 
@@ -214,7 +224,8 @@ func TestValidateBudget_KVCache(t *testing.T) {
 				}
 				if budget.KVCache.Directory != "/tmp/kvcache" ||
 					budget.KVCache.SaveTimeout != 30*time.Second ||
-					budget.KVCache.RestoreTimeout != 30*time.Second {
+					budget.KVCache.RestoreTimeout != 30*time.Second ||
+					budget.KVCache.MaxParallelSaves != 2 {
 					t.Errorf("KVCache defaults=%+v", budget.KVCache)
 				}
 				return
@@ -244,7 +255,8 @@ routing:
           directory: /var/cache/llama-swap/kvcache
           save_timeout: 45s
           restore_timeout: 1m15s
-          single_slot_only: true
+          max_parallel_saves: 3
+          single_slot_only: false
 `
 	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
 	if err != nil {
@@ -254,8 +266,9 @@ routing:
 	if kvCache.Directory != "/var/cache/llama-swap/kvcache" ||
 		kvCache.SaveTimeout != 45*time.Second ||
 		kvCache.RestoreTimeout != 75*time.Second ||
+		kvCache.MaxParallelSaves != 3 ||
 		!kvCache.Enabled ||
-		!kvCache.SingleSlotOnly {
+		kvCache.SingleSlotOnly {
 		t.Errorf("KVCache=%+v", kvCache)
 	}
 }

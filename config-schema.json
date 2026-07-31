@@ -210,33 +210,36 @@
                         "enabled": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Best-effort persistence of llama-server slot 0 around budget-router evictions."
+                            "description": "Best-effort persistence of every explicitly configured llama-server slot around budget-router evictions."
                         },
                         "directory": {
                             "type": "string",
                             "minLength": 1,
                             "default": "/tmp/kvcache",
-                            "description": "Shared directory used by llama-swap and llama-server for <model-id>.bin cache files and <model-id>.json signatures."
+                            "description": "Shared directory used by llama-swap and llama-server for <model-id>-slot-N.bin cache files and versioned <model-id>.json metadata."
                         },
                         "save_timeout": {
                             "type": "string",
                             "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
                             "default": "30s",
-                            "description": "Maximum time to wait for llama-server to save slot 0 before eviction continues."
+                            "description": "Maximum total time to save all slots of one model before eviction continues."
                         },
                         "restore_timeout": {
                             "type": "string",
                             "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
                             "default": "30s",
-                            "description": "Maximum time to wait for llama-server to restore slot 0 before the first queued request is served."
+                            "description": "Maximum total time to restore all saved slots of one model before the first queued request is served."
+                        },
+                        "max_parallel_saves": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 2,
+                            "description": "Maximum number of slot saves and large cache-file writes allowed concurrently across evicted models."
                         },
                         "single_slot_only": {
                             "type": "boolean",
-                            "enum": [
-                                true
-                            ],
-                            "default": true,
-                            "description": "Compatibility guard for the current implementation, which supports only an explicit llama-server --parallel 1."
+                            "deprecated": true,
+                            "description": "Deprecated compatibility option. It is accepted but ignored; all explicitly configured slots are persisted."
                         }
                     },
                     "additionalProperties": false,
