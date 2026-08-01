@@ -388,3 +388,94 @@ func TestKVCache_BudgetDoesNotSaveBusyVictim(t *testing.T) {
 		t.Errorf("target status=%d body=%q", targetRecorder.Code, targetRecorder.Body.String())
 	}
 }
+
+func TestKVCache_ManualUnloadSavesBeforeStop(t *testing.T) {
+	directory := t.TempDir()
+	var saveCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slotID, filename, ok := decodeSlotRequest(w, r)
+		if !ok {
+			return
+		}
+		if err := os.WriteFile(filepath.Join(directory, filename), []byte("slot-cache"), 0o600); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		saveCalls.Add(1)
+		writeSlotSaveResponse(w, slotID, filename)
+	}))
+	t.Cleanup(server.Close)
+
+	model := newFakeProcess("model")
+	model.markReady()
+	var stoppedBeforeSave atomic.Bool
+	model.onStop = func(string) {
+		if saveCalls.Load() != 2 {
+			stoppedBeforeSave.Store(true)
+		}
+	}
+	router := newTestBudget(t, 100, map[string]int{"model": 60}, map[string]process.Process{"model": model})
+	lifecycle, _ := testBudgetKVCacheLifecycle(directory, map[string]config.ModelConfig{
+		"model": testKVCacheModel(directory, server.URL, 2),
+	})
+	router.lifecycle = lifecycle
+
+	router.Unload(time.Second, "model")
+
+	if got := saveCalls.Load(); got != 2 {
+		t.Errorf("save calls=%d want 2", got)
+	}
+	if stoppedBeforeSave.Load() {
+		t.Error("manual unload stopped the process before all slots were saved")
+	}
+	if got := model.stopCalls.Load(); got != 1 {
+		t.Errorf("Stop calls=%d want 1", got)
+	}
+}
+
+func TestKVCache_ShutdownAndConfigReloadSaveBeforeStop(t *testing.T) {
+	directory := t.TempDir()
+	var saveCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slotID, filename, ok := decodeSlotRequest(w, r)
+		if !ok {
+			return
+		}
+		if err := os.WriteFile(filepath.Join(directory, filename), []byte("slot-cache"), 0o600); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		saveCalls.Add(1)
+		writeSlotSaveResponse(w, slotID, filename)
+	}))
+	t.Cleanup(server.Close)
+
+	model := newFakeProcess("model")
+	model.markReady()
+	var stoppedBeforeSave atomic.Bool
+	model.onStop = func(string) {
+		if saveCalls.Load() != 2 {
+			stoppedBeforeSave.Store(true)
+		}
+	}
+	router := newTestBudget(t, 100, map[string]int{"model": 60}, map[string]process.Process{"model": model})
+	lifecycle, _ := testBudgetKVCacheLifecycle(directory, map[string]config.ModelConfig{
+		"model": testKVCacheModel(directory, server.URL, 2),
+	})
+	router.lifecycle = lifecycle
+
+	// Config reload retires the old server through this same Shutdown path.
+	if err := router.Shutdown(time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if got := saveCalls.Load(); got != 2 {
+		t.Errorf("save calls=%d want 2", got)
+	}
+	if stoppedBeforeSave.Load() {
+		t.Error("shutdown stopped the process before all slots were saved")
+	}
+	if got := model.stopCalls.Load(); got != 1 {
+		t.Errorf("Stop calls=%d want 1", got)
+	}
+}

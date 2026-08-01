@@ -91,9 +91,27 @@ type ProcessCommand struct {
 
 	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
+
+	// idleStopHandler hands TTL expiry to the owning router so planned-stop
+	// hooks and request draining run before the process is terminated. It is
+	// immutable after construction. Direct process users retain the historical
+	// self-stop behavior when no handler is configured.
+	idleStopHandler func()
 }
 
 var _ Process = (*ProcessCommand)(nil)
+
+// Option customizes ProcessCommand construction.
+type Option func(*ProcessCommand)
+
+// WithIdleStopHandler routes TTL expiry through fn instead of calling Stop
+// directly. The handler runs synchronously on the TTL watcher goroutine and is
+// expected to complete the planned stop before returning.
+func WithIdleStopHandler(fn func()) Option {
+	return func(p *ProcessCommand) {
+		p.idleStopHandler = fn
+	}
+}
 
 func New(
 	parentCtx context.Context,
@@ -101,6 +119,7 @@ func New(
 	conf config.ModelConfig,
 	processLogger *logmon.Monitor,
 	proxyLogger *logmon.Monitor,
+	options ...Option,
 ) (*ProcessCommand, error) {
 	p := &ProcessCommand{
 		id:            id,
@@ -113,6 +132,9 @@ func New(
 		stopCh:      make(chan stopReq),
 		waitReadyCh: make(chan waitReadyReq),
 		waitDelay:   cmdWaitDelay,
+	}
+	for _, option := range options {
+		option(p)
 	}
 	p.state.Store(StateStopped)
 
@@ -317,7 +339,7 @@ func (p *ProcessCommand) run() {
 								}
 								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
 									p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-									p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
+									p.stopForTTL()
 									return
 								}
 							}
@@ -399,6 +421,14 @@ func (p *ProcessCommand) run() {
 			stop.respond <- nil
 		}
 	}
+}
+
+func (p *ProcessCommand) stopForTTL() {
+	if p.idleStopHandler != nil {
+		p.idleStopHandler()
+		return
+	}
+	p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
 }
 
 func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout time.Duration) startResult {

@@ -655,13 +655,20 @@ matrix:
 # Optional KV-cache persistence
 #
 # When `kv_cache.enabled` is true, the budget router asks llama-server to save
-# every logical slot before evicting an idle model. After that model is loaded
-# again and passes its health check, the router restores each successfully
-# saved slot into the same slot ID before releasing the first queued request.
-# This also applies with `--kv-unified`: the KV allocation may be unified, but
-# llama-server still exposes logical slots through its slot API. Save and
-# restore are best effort. A failure is logged per slot and never prevents
-# eviction or serving; successful slots remain usable when another slot fails.
+# every logical slot before every planned model stop: per-model TTL, globalTTL,
+# budget eviction, configuration reload, controlled llama-swap shutdown, and
+# manual/API unload. The router first fences new requests and drains handlers
+# already using the model, then saves once and stops the process. Concurrent
+# stop causes join the same operation, so a budget eviction cannot duplicate a
+# simultaneous administrative save.
+#
+# After that model is loaded again and passes its health check, the router
+# restores each successfully saved slot into the same slot ID before releasing
+# the first queued request. This also applies with `--kv-unified`: the KV
+# allocation may be unified, but llama-server still exposes logical slots
+# through its slot API. Save and restore are best effort. A failure is logged
+# per slot and never prevents a planned stop or later serving; successful slots
+# remain usable when another slot fails.
 #
 # Eligible model commands must explicitly contain `--parallel N` (or `-np N`)
 # with N >= 1 and `--slot-save-path <directory>`. Commands without an explicit
@@ -677,11 +684,15 @@ matrix:
 #
 # `save_timeout` and `restore_timeout` each cover the complete operation for
 # one model, not every slot separately. Saves run with at most
-# `max_parallel_saves` concurrent file writes across all victims (default 2);
+# `max_parallel_saves` concurrent file writes across stopping models (default 2);
 # restores complete within their shared deadline before requests are released.
 # Increase these model-wide deadlines carefully for large contexts or slow
 # storage. The old `single_slot_only` option is accepted for compatibility but
 # ignored.
+# SIGINT and SIGTERM use llama-swap's bounded graceful-shutdown budget for HTTP
+# drain, slot saves, and process stops. If that deadline expires, shutdown may
+# proceed without a complete cache. No persistence guarantee is possible for a
+# process crash, SIGKILL, machine failure, or another hard termination.
 #
 # The default directory is `/tmp/kvcache`. On many systems `/tmp` is cleared
 # during reboot or container restart, so configure a persistent host directory

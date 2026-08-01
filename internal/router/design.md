@@ -318,8 +318,10 @@ Method by method, as implemented in `base.go`:
   in-flight contract above). This is the one `Effects` method whose return value
   carries state-machine significance.
 
-- **`StopProcesses(timeout, ids)`** — stop processes in parallel and **block**
-  until all have stopped. Used by `OnUnload` so an admin `Unload` call can
+- **`StopProcesses(timeout, ids)`** — fence new grants, drain already granted
+  handlers, run the optional pre-stop lifecycle, then stop processes in
+  parallel and **block** until all have stopped. Concurrent stops of one model
+  join the same operation. Used by `OnUnload` so an admin `Unload` call can
   guarantee the process is dead by the time it returns. (Note `StartSwap` is
   async but `StopProcesses` is sync — the difference is deliberate and tied to
   the caller's expectations.)

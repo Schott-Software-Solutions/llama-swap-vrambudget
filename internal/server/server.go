@@ -329,10 +329,10 @@ func (s *Server) CloseStreams() {
 // Shutdown stops the local and peer routers in parallel. It is idempotent;
 // repeated calls return nil without re-running shutdown.
 //
-// Callers must drain inflight HTTP requests (httpServer.Shutdown) before
-// calling this, otherwise inflight requests 502 when their processes are torn
-// down. Call CloseStreams before httpServer.Shutdown so SSE streams do not
-// block the drain.
+// The local router independently fences and drains model requests before each
+// planned process stop. Callers should still drain the outer HTTP server first
+// so all middleware and peer requests finish cleanly. Call CloseStreams before
+// httpServer.Shutdown so SSE streams do not block that drain.
 func (s *Server) Shutdown(timeout time.Duration) error {
 	if !s.shuttingDown.CompareAndSwap(false, true) {
 		return nil

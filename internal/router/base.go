@@ -39,6 +39,9 @@ type baseRouter struct {
 	schedule  scheduler.Scheduler
 	lifecycle modelLifecycle
 
+	stopStatesMu sync.Mutex
+	stopStates   map[string]*modelStopState
+
 	// shutdownCtx governs the request machinery: cancelling it tells grant()
 	// and ServeHTTP to stop granting and reject callers. It is deliberately
 	// separate from procCtx — see procCtx below.
@@ -96,6 +99,7 @@ func newBaseRouter(
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
+		stopStates:  make(map[string]*modelStopState),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -196,12 +200,25 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
 // the router would never again be willing to evict this model.
 func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 	p := b.processes[modelID]
-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p)})
+	stopState := b.modelStopState(modelID)
+	if !stopState.enter() {
+		b.grant(req, scheduler.HandlerResp{Err: fmt.Errorf("%s: model %s is stopping", b.name, modelID)})
+		return false
+	}
+	if b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, stopState)}) {
+		return true
+	}
+	stopState.leave()
+	return false
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
 // parallel and blocking until all have stopped.
 func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
+	b.stopProcesses(context.Background(), timeout, ids)
+}
+
+func (b *baseRouter) stopProcesses(ctx context.Context, timeout time.Duration, ids []string) {
 	var wg sync.WaitGroup
 	for _, id := range ids {
 		p, ok := b.processes[id]
@@ -211,12 +228,74 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 		wg.Add(1)
 		go func(id string, p process.Process) {
 			defer wg.Done()
-			if err := p.Stop(timeout); err != nil {
+			if err := b.stopProcess(ctx, id, p, timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
 		}(id, p)
 	}
 	wg.Wait()
+}
+
+func (b *baseRouter) stopProcess(ctx context.Context, id string, p process.Process, timeout time.Duration) error {
+	stopState := b.modelStopState(id)
+	op, owner := stopState.begin()
+	if !owner {
+		select {
+		case <-op.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer stopState.finish(op)
+
+	// Stopped processes have no live slot state to persist. Checking after we
+	// own the stop generation also makes sequential duplicate stops no-ops.
+	state := p.State()
+	if state == process.StateStopped || state == process.StateShutdown {
+		return nil
+	}
+
+	select {
+	case <-op.drained:
+	case <-ctx.Done():
+		// A bounded shutdown may have to abandon the graceful guarantee. The
+		// process stop below still runs with the tiny remaining budget so the
+		// caller can proceed to its hard-shutdown backstop.
+		b.logger.Warnf("%s: request drain timed out model=%s error=%v", b.name, id, ctx.Err())
+	}
+
+	if p.State() == process.StateReady && b.lifecycle != nil && ctx.Err() == nil {
+		b.lifecycle.BeforeModelStop(ctx, id)
+	}
+
+	return p.Stop(clampStopTimeout(ctx, timeout))
+}
+
+func clampStopTimeout(ctx context.Context, timeout time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return timeout
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Millisecond
+	}
+	if timeout <= 0 || remaining < timeout {
+		return remaining
+	}
+	return timeout
+}
+
+func (b *baseRouter) modelStopState(modelID string) *modelStopState {
+	b.stopStatesMu.Lock()
+	defer b.stopStatesMu.Unlock()
+	state := b.stopStates[modelID]
+	if state == nil {
+		state = &modelStopState{}
+		b.stopStates[modelID] = state
+	}
+	return state
 }
 
 // trackedServe is the wrapper that closes the loop on in-flight tracking.
@@ -229,7 +308,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // The select on shutdownCtx.Done() is a release valve: if the router is
 // already shutting down, nobody is reading serveDoneCh, so we drop the
 // notification rather than blocking the HTTP goroutine forever.
-func (b *baseRouter) trackedServe(modelID string, p process.Process) http.HandlerFunc {
+func (b *baseRouter) trackedServe(modelID string, p process.Process, stopState *modelStopState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			select {
@@ -237,31 +316,14 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 			case <-b.shutdownCtx.Done():
 			}
 		}()
+		defer stopState.leave()
 		p.ServeHTTP(w, r)
 	}
 }
 
 func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	timeout := b.healthCheckTimeout()
-
-	var wg sync.WaitGroup
-	for _, mID := range toStop {
-		wg.Add(1)
-		go func(p process.Process, id string) {
-			defer wg.Done()
-			// FIFO starts a swap only after every selected victim has drained
-			// its in-flight requests. While this swap is active, new requests
-			// for a victim collide and queue, so the optional hook and Stop
-			// cannot race a serving request.
-			if b.lifecycle != nil {
-				b.lifecycle.BeforeModelStop(b.shutdownCtx, id)
-			}
-			if err := p.Stop(timeout); err != nil {
-				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
-			}
-		}(b.processes[mID], mID)
-	}
-	wg.Wait()
+	b.stopProcesses(b.shutdownCtx, timeout, toStop)
 
 	// Reaching this point means Process.Stop has returned for every victim.
 	// The Process contract guarantees termination before return; any later
@@ -311,32 +373,17 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 		stopTimeout = b.healthCheckTimeout()
 	}
 
-	var wg sync.WaitGroup
-	for i, p := range b.processes {
-		wg.Add(1)
-		go func(id string, p process.Process) {
-			defer wg.Done()
-			if err := p.Stop(stopTimeout); err != nil {
-				b.logger.Warnf("%s failed to stop process %s: %v", b.name, id, err)
-			}
-		}(i, p)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	stopCtx := context.Background()
+	cancelStop := func() {}
 	if req.timeout > 0 {
-		select {
-		case <-done:
-		case <-time.After(req.timeout):
-			<-done
-		}
-	} else {
-		<-done
+		stopCtx, cancelStop = context.WithTimeout(stopCtx, req.timeout)
 	}
+	defer cancelStop()
+	ids := make([]string, 0, len(b.processes))
+	for id := range b.processes {
+		ids = append(ids, id)
+	}
+	b.stopProcesses(stopCtx, stopTimeout, ids)
 
 	// Every process is stopped (children reaped via Stop()). Cancel procCtx so
 	// the process run-loop goroutines exit; they are already StateStopped, so
@@ -363,6 +410,15 @@ func (b *baseRouter) unloadTimeout(modelID string) time.Duration {
 		return time.Duration(mc.UnloadTimeout) * time.Second
 	}
 	return time.Duration(b.config.UnloadTimeout) * time.Second
+}
+
+// idleStopHandler is installed on every router-owned ProcessCommand. Both a
+// per-model TTL and a normalized globalTTL therefore enter the same unload,
+// request-drain, lifecycle-save, and process-stop path as administrative stops.
+func (b *baseRouter) idleStopHandler(modelID string) func() {
+	return func() {
+		b.Unload(0, modelID)
+	}
 }
 
 func (b *baseRouter) Handles(model string) bool {
@@ -401,10 +457,10 @@ func (b *baseRouter) RunningModels() map[string]process.ProcessState {
 // models are dropped, and any deferred swaps that were waiting on those
 // models become eligible to start.
 //
-// In-flight requests being served by an unloaded process are not waited
-// for — Stop kills the upstream, those callers see whatever error the
-// reverse proxy surfaces and may retry. Their trackedServe defers fire
-// normally and decrement inFlight as the dying handlers return.
+// A planned-stop fence is installed before the process lifecycle begins. It
+// prevents new grants from reaching the process and waits for handlers that
+// were already granted to finish before lifecycle persistence and Stop run.
+// Concurrent stop requests for the same model join that one operation.
 //
 // A timeout <= 0 unloads each targeted model with its configured
 // unloadTimeout: targets sharing a timeout are stopped in parallel within one

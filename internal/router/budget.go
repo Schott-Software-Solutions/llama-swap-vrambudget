@@ -36,7 +36,8 @@ func NewBudget(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Budg
 
 	for modelID, modelCfg := range conf.Models {
 		procLog := logmon.NewWriter(upstreamlog)
-		p, err := process.New(base.procCtx, modelID, modelCfg, procLog, proxylog)
+		p, err := process.New(base.procCtx, modelID, modelCfg, procLog, proxylog,
+			process.WithIdleStopHandler(base.idleStopHandler(modelID)))
 		if err != nil {
 			base.shutdownFn()
 			base.procCancel()

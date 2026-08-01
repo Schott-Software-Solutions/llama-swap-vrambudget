@@ -661,8 +661,9 @@ routing:
           # make a model less attractive to evict; unlisted models use zero.
           evict_costs:
             llama: 100
-        # Optional best-effort llama-server slot-cache persistence. Enabling
-        # this also requires each eligible model command to use explicit
+        # Optional best-effort llama-server slot-cache persistence before every
+        # planned model stop (TTL, eviction, reload, shutdown, manual unload).
+        # Enabling this also requires each eligible model command to use explicit
         # "--parallel N --slot-save-path /tmp/kvcache" flags. All N slots are
         # saved separately, including when --kv-unified is enabled.
         kv_cache:

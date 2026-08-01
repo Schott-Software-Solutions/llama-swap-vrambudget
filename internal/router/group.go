@@ -42,7 +42,8 @@ func NewGroup(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Group
 			return nil, fmt.Errorf("no model config for %q", mid)
 		}
 		procLog := logmon.NewWriter(upstreamlog)
-		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog)
+		p, err := process.New(base.procCtx, mid, modelCfg, procLog, proxylog,
+			process.WithIdleStopHandler(base.idleStopHandler(mid)))
 		if err != nil {
 			base.shutdownFn()
 			base.procCancel()

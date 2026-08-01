@@ -276,9 +276,10 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	}
 
 	// Stop the targeted processes. Done synchronously so Unload's caller can
-	// rely on "after Unload returns, the process is stopped". inFlight is
-	// intentionally NOT cleared here: each dying handler will fire its tracked
-	// serve and reach OnServeDone in the normal way.
+	// rely on "after Unload returns, the process is stopped". The Effects
+	// implementation fences new grants and waits for already granted handlers.
+	// inFlight is intentionally NOT cleared here: each drained handler fires its
+	// tracked serve and reaches OnServeDone after this run-loop call returns.
 	s.effects.StopProcesses(timeout, targets)
 	at := s.clock.Now()
 	for _, modelID := range targets {

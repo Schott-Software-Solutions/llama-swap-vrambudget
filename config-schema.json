@@ -210,7 +210,7 @@
                         "enabled": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Best-effort persistence of every explicitly configured llama-server slot around budget-router evictions."
+                            "description": "Best-effort persistence of every explicitly configured llama-server slot before planned model stops, including TTL, budget eviction, reload, shutdown, and manual unload."
                         },
                         "directory": {
                             "type": "string",
@@ -222,7 +222,7 @@
                             "type": "string",
                             "pattern": "^[-+]?(\\d+(\\.\\d+)?(ns|us|ms|s|m|h))+$",
                             "default": "30s",
-                            "description": "Maximum total time to save all slots of one model before eviction continues."
+                            "description": "Maximum total time to save all slots of one model before its planned stop continues."
                         },
                         "restore_timeout": {
                             "type": "string",
@@ -234,7 +234,7 @@
                             "type": "integer",
                             "minimum": 1,
                             "default": 2,
-                            "description": "Maximum number of slot saves and large cache-file writes allowed concurrently across evicted models."
+                            "description": "Maximum number of slot saves and large cache-file writes allowed concurrently across stopping models."
                         },
                         "single_slot_only": {
                             "type": "boolean",

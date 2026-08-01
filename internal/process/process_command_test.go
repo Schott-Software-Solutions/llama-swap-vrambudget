@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,22 @@ func newProcessCommand(t *testing.T, conf config.ModelConfig) *ProcessCommand {
 		t.Fatalf("New: %v", err)
 	}
 	return p
+}
+
+func TestProcessCommand_TTLDelegatesToIdleStopHandler(t *testing.T) {
+	var calls atomic.Int32
+	p := &ProcessCommand{
+		config: config.ModelConfig{UnloadTimeout: 17},
+		idleStopHandler: func() {
+			calls.Add(1)
+		},
+	}
+
+	p.stopForTTL()
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("idle stop handler calls=%d want 1", got)
+	}
 }
 
 // runAsync starts Run in a goroutine and waits until the process is ready,
